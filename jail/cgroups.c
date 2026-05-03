@@ -677,6 +677,7 @@ enum {
 	OCI_LINUX_CGROUPS_MEMORY_SWAPPINESS,
 	OCI_LINUX_CGROUPS_MEMORY_DISABLEOOMKILLER,
 	OCI_LINUX_CGROUPS_MEMORY_USEHIERARCHY,
+	OCI_LINUX_CGROUPS_MEMORY_CHECKBEFOREUPDATE,
 	__OCI_LINUX_CGROUPS_MEMORY_MAX,
 };
 
@@ -689,6 +690,7 @@ static const struct blobmsg_policy oci_linux_cgroups_memory_policy[] = {
 	[OCI_LINUX_CGROUPS_MEMORY_SWAPPINESS] = { "swappiness", BLOBMSG_CAST_INT64 },
 	[OCI_LINUX_CGROUPS_MEMORY_DISABLEOOMKILLER] = { "disableOOMKiller", BLOBMSG_TYPE_BOOL },
 	[OCI_LINUX_CGROUPS_MEMORY_USEHIERARCHY] = { "useHierarchy", BLOBMSG_TYPE_BOOL },
+	[OCI_LINUX_CGROUPS_MEMORY_CHECKBEFOREUPDATE] = { "checkBeforeUpdate", BLOBMSG_TYPE_BOOL },
 };
 
 static int parseOCIlinuxcgroups_legacy_memory(struct blob_attr *msg)
@@ -712,7 +714,6 @@ static int parseOCIlinuxcgroups_legacy_memory(struct blob_attr *msg)
 	    tb[OCI_LINUX_CGROUPS_MEMORY_DISABLEOOMKILLER] ||
 	    tb[OCI_LINUX_CGROUPS_MEMORY_USEHIERARCHY])
 		return ENOTSUP;
-
 
 	if (tb[OCI_LINUX_CGROUPS_MEMORY_LIMIT]) {
 		limit = blobmsg_cast_s64(tb[OCI_LINUX_CGROUPS_MEMORY_LIMIT]);
