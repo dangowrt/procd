@@ -100,6 +100,7 @@ struct mknod_args {
 static struct {
 	char *name;
 	char *hostname;
+	char *domainname;
 	char **jail_argv;
 	char *cwd;
 	char *seccomp;
@@ -293,6 +294,7 @@ static void free_opts(bool parent) {
 	free_sysctl();
 	free_devices();
 	free(opts.hostname);
+	free(opts.domainname);
 	free(opts.cwd);
 	free(opts.uidmap);
 	free(opts.gidmap);
@@ -1470,9 +1472,17 @@ static int exec_jail(void *arg)
 		}
 	}
 
-	if (opts.namespace && opts.hostname && strlen(opts.hostname) > 0
+	if (((opts.namespace & CLONE_NEWUTS) || opts.setns.uts != -1)
+			&& opts.hostname && strlen(opts.hostname) > 0
 			&& sethostname(opts.hostname, strlen(opts.hostname))) {
 		ERROR("sethostname(%s) failed: %m\n", opts.hostname);
+		free_and_exit(EXIT_FAILURE);
+	}
+
+	if (((opts.namespace & CLONE_NEWUTS) || opts.setns.uts != -1)
+			&& opts.domainname && strlen(opts.domainname) > 0
+			&& setdomainname(opts.domainname, strlen(opts.domainname))) {
+		ERROR("setdomainname(%s) failed: %m\n", opts.domainname);
 		free_and_exit(EXIT_FAILURE);
 	}
 
@@ -2678,6 +2688,7 @@ static int parseOCIlinux(struct blob_attr *msg)
 enum {
 	OCI_VERSION,
 	OCI_HOSTNAME,
+	OCI_DOMAINNAME,
 	OCI_PROCESS,
 	OCI_ROOT,
 	OCI_MOUNTS,
@@ -2690,6 +2701,7 @@ enum {
 static const struct blobmsg_policy oci_policy[] = {
 	[OCI_VERSION] = { "ociVersion", BLOBMSG_TYPE_STRING },
 	[OCI_HOSTNAME] = { "hostname", BLOBMSG_TYPE_STRING },
+	[OCI_DOMAINNAME] = { "domainname", BLOBMSG_TYPE_STRING },
 	[OCI_PROCESS] = { "process", BLOBMSG_TYPE_TABLE },
 	[OCI_ROOT] = { "root", BLOBMSG_TYPE_TABLE },
 	[OCI_MOUNTS] = { "mounts", BLOBMSG_TYPE_ARRAY },
@@ -2728,6 +2740,9 @@ static int parseOCI(const char *jsonfile)
 
 	if (tb[OCI_HOSTNAME])
 		opts.hostname = strdup(blobmsg_get_string(tb[OCI_HOSTNAME]));
+
+	if (tb[OCI_DOMAINNAME])
+		opts.domainname = strdup(blobmsg_get_string(tb[OCI_DOMAINNAME]));
 
 	if (!tb[OCI_PROCESS]) {
 		res=ENODATA;
