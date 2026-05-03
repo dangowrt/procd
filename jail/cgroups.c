@@ -767,13 +767,18 @@ static int parseOCIlinuxcgroups_legacy_pids(struct blob_attr *msg)
 {
 	struct blob_attr *tb[__OCI_LINUX_CGROUPS_MEMORY_MAX];
 	char tmp[32] = { 0 };
+	int64_t limit;
 
 	blobmsg_parse(oci_linux_cgroups_pids_policy, __OCI_LINUX_CGROUPS_PIDS_MAX, tb, blobmsg_data(msg), blobmsg_len(msg));
 
 	if (!tb[OCI_LINUX_CGROUPS_PIDS_LIMIT])
-		return EINVAL;
+		return 0;
 
-	snprintf(tmp, sizeof(tmp), "%" PRIu64, blobmsg_cast_u64(tb[OCI_LINUX_CGROUPS_PIDS_LIMIT]));
+	limit = blobmsg_cast_s64(tb[OCI_LINUX_CGROUPS_PIDS_LIMIT]);
+	if (limit < 0)
+		strcpy(tmp, "max");
+	else
+		snprintf(tmp, sizeof(tmp), "%" PRId64, limit);
 
 	cgroups_set("pids.max", tmp);
 
