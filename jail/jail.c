@@ -2260,6 +2260,7 @@ static int parseOCIrlimit(struct blob_attr *msg)
 };
 
 enum {
+	OCI_PROCESS_APPARMORPROFILE,
 	OCI_PROCESS_ARGS,
 	OCI_PROCESS_CAPABILITIES,
 	OCI_PROCESS_CONSOLESIZE,
@@ -2271,12 +2272,14 @@ enum {
 	OCI_PROCESS_NONEWPRIVILEGES,
 	OCI_PROCESS_RLIMITS,
 	OCI_PROCESS_SCHEDULER,
+	OCI_PROCESS_SELINUXLABEL,
 	OCI_PROCESS_TERMINAL,
 	OCI_PROCESS_USER,
 	__OCI_PROCESS_MAX,
 };
 
 static const struct blobmsg_policy oci_process_policy[] = {
+	[OCI_PROCESS_APPARMORPROFILE] = { "apparmorProfile", BLOBMSG_TYPE_STRING },
 	[OCI_PROCESS_ARGS] = { "args", BLOBMSG_TYPE_ARRAY },
 	[OCI_PROCESS_CAPABILITIES] = { "capabilities", BLOBMSG_TYPE_TABLE },
 	[OCI_PROCESS_CONSOLESIZE] = { "consoleSize", BLOBMSG_TYPE_TABLE },
@@ -2288,6 +2291,7 @@ static const struct blobmsg_policy oci_process_policy[] = {
 	[OCI_PROCESS_NONEWPRIVILEGES] = { "noNewPrivileges", BLOBMSG_TYPE_BOOL },
 	[OCI_PROCESS_RLIMITS] = { "rlimits", BLOBMSG_TYPE_ARRAY },
 	[OCI_PROCESS_SCHEDULER] = { "scheduler", BLOBMSG_TYPE_TABLE },
+	[OCI_PROCESS_SELINUXLABEL] = { "selinuxLabel", BLOBMSG_TYPE_STRING },
 	[OCI_PROCESS_TERMINAL] = { "terminal", BLOBMSG_TYPE_BOOL },
 	[OCI_PROCESS_USER] = { "user", BLOBMSG_TYPE_TABLE },
 };
@@ -2334,6 +2338,16 @@ static int parseOCIprocess(struct blob_attr *msg)
 	int rem, res;
 
 	blobmsg_parse(oci_process_policy, __OCI_PROCESS_MAX, tb, blobmsg_data(msg), blobmsg_len(msg));
+
+	if (tb[OCI_PROCESS_APPARMORPROFILE]) {
+		ERROR("process.apparmorProfile is not supported\n");
+		return ENOTSUP;
+	}
+
+	if (tb[OCI_PROCESS_SELINUXLABEL]) {
+		ERROR("process.selinuxLabel is not supported\n");
+		return ENOTSUP;
+	}
 
 	if (!tb[OCI_PROCESS_ARGS])
 		return ENOENT;
@@ -2789,6 +2803,7 @@ enum {
 	OCI_LINUX_TIMEOFFSETS,
 	OCI_LINUX_NETDEVICES,
 	OCI_LINUX_MEMORYPOLICY,
+	OCI_LINUX_MOUNTLABEL,
 	__OCI_LINUX_MAX,
 };
 
@@ -2808,6 +2823,7 @@ static const struct blobmsg_policy oci_linux_policy[] = {
 	[OCI_LINUX_TIMEOFFSETS] = { "timeOffsets", BLOBMSG_TYPE_TABLE },
 	[OCI_LINUX_NETDEVICES] = { "netDevices", BLOBMSG_TYPE_TABLE },
 	[OCI_LINUX_MEMORYPOLICY] = { "memoryPolicy", BLOBMSG_TYPE_TABLE },
+	[OCI_LINUX_MOUNTLABEL] = { "mountLabel", BLOBMSG_TYPE_STRING },
 };
 
 enum {
@@ -2887,6 +2903,11 @@ static int parseOCIlinux(struct blob_attr *msg)
 
 	if (tb[OCI_LINUX_MEMORYPOLICY]) {
 		ERROR("linux.memoryPolicy is not supported on OpenWrt\n");
+		return ENOTSUP;
+	}
+
+	if (tb[OCI_LINUX_MOUNTLABEL]) {
+		ERROR("linux.mountLabel is not supported\n");
 		return ENOTSUP;
 	}
 
