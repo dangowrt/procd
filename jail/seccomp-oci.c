@@ -36,6 +36,10 @@
 #include "../syscall-names.h"
 #include "seccomp-syscalls-helpers.h"
 
+#ifndef MAX_ERRNO
+#define MAX_ERRNO	4095
+#endif
+
 static uint32_t resolve_action(char *actname)
 {
 	if (!strcmp(actname, "SCMP_ACT_KILL"))
@@ -159,6 +163,7 @@ static uint32_t resolve_architecture(char *archname)
 
 enum {
 	OCI_LINUX_SECCOMP_DEFAULTACTION,
+	OCI_LINUX_SECCOMP_DEFAULTERRNORET,
 	OCI_LINUX_SECCOMP_ARCHITECTURES,
 	OCI_LINUX_SECCOMP_FLAGS,
 	OCI_LINUX_SECCOMP_SYSCALLS,
@@ -167,6 +172,7 @@ enum {
 
 static const struct blobmsg_policy oci_linux_seccomp_policy[] = {
 	[OCI_LINUX_SECCOMP_DEFAULTACTION] = { "defaultAction", BLOBMSG_TYPE_STRING },
+	[OCI_LINUX_SECCOMP_DEFAULTERRNORET] = { "defaultErrnoRet", BLOBMSG_TYPE_INT32 },
 	[OCI_LINUX_SECCOMP_ARCHITECTURES] = { "architectures", BLOBMSG_TYPE_ARRAY },
 	[OCI_LINUX_SECCOMP_FLAGS] = { "flags", BLOBMSG_TYPE_ARRAY },
 	[OCI_LINUX_SECCOMP_SYSCALLS] = { "syscalls", BLOBMSG_TYPE_ARRAY },
@@ -226,6 +232,22 @@ struct sock_fprog *parseOCIlinuxseccomp(struct blob_attr *msg)
 	}
 
 	default_policy = resolve_action(blobmsg_get_string(tb[OCI_LINUX_SECCOMP_DEFAULTACTION]));
+
+	if (default_policy == SECCOMP_RET_ERRNO) {
+		uint32_t errnoret = EPERM;
+		if (tb[OCI_LINUX_SECCOMP_DEFAULTERRNORET]) {
+			errnoret = blobmsg_get_u32(tb[OCI_LINUX_SECCOMP_DEFAULTERRNORET]);
+			if (errnoret < 1 || errnoret > MAX_ERRNO) {
+				ERROR("seccomp: defaultErrnoRet %u out of range (1..%u)\n",
+				      errnoret, MAX_ERRNO);
+				return NULL;
+			}
+		}
+		default_policy = SECCOMP_RET_ERROR(errnoret);
+	} else if (tb[OCI_LINUX_SECCOMP_DEFAULTERRNORET]) {
+		ERROR("seccomp: defaultErrnoRet only valid with SCMP_ACT_ERRNO defaultAction\n");
+		return NULL;
+	}
 
 	/* verify architecture while ignoring the x86_64 anomaly for now */
 	if (tb[OCI_LINUX_SECCOMP_ARCHITECTURES]) {
@@ -317,11 +339,18 @@ struct sock_fprog *parseOCIlinuxseccomp(struct blob_attr *msg)
 		action = resolve_action(blobmsg_get_string(
 				tbn[OCI_LINUX_SECCOMP_SYSCALLS_ACTION]));
 		if (tbn[OCI_LINUX_SECCOMP_SYSCALLS_ERRNORET]) {
+			uint32_t errnoret;
+
 			if (action != SECCOMP_RET_ERRNO)
 				goto errout1;
 
-			action = SECCOMP_RET_ERROR(blobmsg_get_u32(
-					tbn[OCI_LINUX_SECCOMP_SYSCALLS_ERRNORET]));
+			errnoret = blobmsg_get_u32(tbn[OCI_LINUX_SECCOMP_SYSCALLS_ERRNORET]);
+			if (errnoret < 1 || errnoret > MAX_ERRNO) {
+				ERROR("seccomp: errnoRet %u out of range (1..%u)\n",
+				      errnoret, MAX_ERRNO);
+				goto errout1;
+			}
+			action = SECCOMP_RET_ERROR(errnoret);
 		} else if (action == SECCOMP_RET_ERRNO)
 			action = SECCOMP_RET_ERROR(EPERM);
 
