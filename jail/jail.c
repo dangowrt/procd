@@ -1412,6 +1412,120 @@ static int applyOCIprocessiopriority(void)
 	return 0;
 }
 
+#ifdef CLONE_NEWTIME
+enum {
+	OCI_LINUX_TIMEOFFSETS_SECS,
+	OCI_LINUX_TIMEOFFSETS_NANOSECS,
+	__OCI_LINUX_TIMEOFFSETS_CLOCK_MAX,
+};
+
+static const struct blobmsg_policy oci_linux_timeoffsets_clock_policy[] = {
+	[OCI_LINUX_TIMEOFFSETS_SECS] = { "secs", BLOBMSG_CAST_INT64 },
+	[OCI_LINUX_TIMEOFFSETS_NANOSECS] = { "nanosecs", BLOBMSG_TYPE_INT32 },
+};
+
+struct procd_timens_offset {
+	bool set;
+	int64_t secs;
+	uint32_t nanosecs;
+};
+
+static struct {
+	struct procd_timens_offset monotonic;
+	struct procd_timens_offset boottime;
+} timens_offsets;
+
+enum {
+	OCI_LINUX_TIMEOFFSETS_MONOTONIC,
+	OCI_LINUX_TIMEOFFSETS_BOOTTIME,
+	__OCI_LINUX_TIMEOFFSETS_MAX,
+};
+
+static const struct blobmsg_policy oci_linux_timeoffsets_policy[] = {
+	[OCI_LINUX_TIMEOFFSETS_MONOTONIC] = { "monotonic", BLOBMSG_TYPE_TABLE },
+	[OCI_LINUX_TIMEOFFSETS_BOOTTIME] = { "boottime", BLOBMSG_TYPE_TABLE },
+};
+
+static int parseOCItimensclock(struct blob_attr *msg, struct procd_timens_offset *off)
+{
+	struct blob_attr *tb[__OCI_LINUX_TIMEOFFSETS_CLOCK_MAX];
+
+	blobmsg_parse(oci_linux_timeoffsets_clock_policy, __OCI_LINUX_TIMEOFFSETS_CLOCK_MAX, tb,
+		      blobmsg_data(msg), blobmsg_len(msg));
+
+	if (tb[OCI_LINUX_TIMEOFFSETS_SECS])
+		off->secs = blobmsg_cast_s64(tb[OCI_LINUX_TIMEOFFSETS_SECS]);
+
+	if (tb[OCI_LINUX_TIMEOFFSETS_NANOSECS]) {
+		uint32_t ns = blobmsg_get_u32(tb[OCI_LINUX_TIMEOFFSETS_NANOSECS]);
+
+		if (ns > 999999999) {
+			ERROR("timeOffsets: nanosecs %u out of range\n", ns);
+			return EINVAL;
+		}
+		off->nanosecs = ns;
+	}
+
+	off->set = true;
+	return 0;
+}
+
+static int parseOCIlinuxtimeoffsets(struct blob_attr *msg)
+{
+	struct blob_attr *tb[__OCI_LINUX_TIMEOFFSETS_MAX];
+	int res;
+
+	blobmsg_parse(oci_linux_timeoffsets_policy, __OCI_LINUX_TIMEOFFSETS_MAX, tb,
+		      blobmsg_data(msg), blobmsg_len(msg));
+
+	if (tb[OCI_LINUX_TIMEOFFSETS_MONOTONIC]) {
+		res = parseOCItimensclock(tb[OCI_LINUX_TIMEOFFSETS_MONOTONIC], &timens_offsets.monotonic);
+		if (res)
+			return res;
+	}
+
+	if (tb[OCI_LINUX_TIMEOFFSETS_BOOTTIME]) {
+		res = parseOCItimensclock(tb[OCI_LINUX_TIMEOFFSETS_BOOTTIME], &timens_offsets.boottime);
+		if (res)
+			return res;
+	}
+
+	return 0;
+}
+
+static int applyOCIlinuxtimeoffsets(void)
+{
+	int fd = open("/proc/self/timens_offsets", O_WRONLY | O_CLOEXEC);
+	int saved_errno;
+
+	if (fd < 0) {
+		ERROR("open(/proc/self/timens_offsets): %m\n");
+		return errno;
+	}
+
+	if (timens_offsets.monotonic.set &&
+	    dprintf(fd, "%d %" PRId64 " %" PRIu32 "\n", CLOCK_MONOTONIC,
+		    timens_offsets.monotonic.secs, timens_offsets.monotonic.nanosecs) < 0) {
+		saved_errno = errno;
+		ERROR("timens_offsets monotonic: %m\n");
+		close(fd);
+		return saved_errno;
+	}
+
+	if (timens_offsets.boottime.set &&
+	    dprintf(fd, "%d %" PRId64 " %" PRIu32 "\n", CLOCK_BOOTTIME,
+		    timens_offsets.boottime.secs, timens_offsets.boottime.nanosecs) < 0) {
+		saved_errno = errno;
+		ERROR("timens_offsets boottime: %m\n");
+		close(fd);
+		return saved_errno;
+	}
+
+	close(fd);
+	return 0;
+}
+#endif
+
 static void pre_exec_jail(struct uloop_timeout *t);
 static struct uloop_timeout pre_exec_timeout = {
 	.cb = pre_exec_jail,
@@ -1456,6 +1570,13 @@ static int exec_jail(void *arg)
 		unshare(CLONE_NEWCGROUP);
 
 	setns_open(CLONE_NEWCGROUP);
+
+#ifdef CLONE_NEWTIME
+	if ((opts.namespace & CLONE_NEWTIME) && opts.setns.time == -1 &&
+	    (timens_offsets.monotonic.set || timens_offsets.boottime.set) &&
+	    applyOCIlinuxtimeoffsets())
+		free_and_exit(EXIT_FAILURE);
+#endif
 
 	if ((opts.namespace & CLONE_NEWUSER) || (opts.setns.user != -1)) {
 		if (setregid(0, 0) < 0) {
@@ -2512,6 +2633,7 @@ enum {
 	OCI_LINUX_READONLYPATHS,
 	OCI_LINUX_ROOTFSPROPAGATION,
 	OCI_LINUX_PERSONALITY,
+	OCI_LINUX_TIMEOFFSETS,
 	__OCI_LINUX_MAX,
 };
 
@@ -2528,6 +2650,7 @@ static const struct blobmsg_policy oci_linux_policy[] = {
 	[OCI_LINUX_READONLYPATHS] = { "readonlyPaths", BLOBMSG_TYPE_ARRAY },
 	[OCI_LINUX_ROOTFSPROPAGATION] = { "rootfsPropagation", BLOBMSG_TYPE_STRING },
 	[OCI_LINUX_PERSONALITY] = { "personality", BLOBMSG_TYPE_TABLE },
+	[OCI_LINUX_TIMEOFFSETS] = { "timeOffsets", BLOBMSG_TYPE_TABLE },
 };
 
 enum {
@@ -2593,6 +2716,14 @@ static int parseOCIlinux(struct blob_attr *msg)
 		if (res)
 			return res;
 	}
+
+#ifdef CLONE_NEWTIME
+	if (tb[OCI_LINUX_TIMEOFFSETS]) {
+		res = parseOCIlinuxtimeoffsets(tb[OCI_LINUX_TIMEOFFSETS]);
+		if (res)
+			return res;
+	}
+#endif
 
 	if (tb[OCI_LINUX_NAMESPACES]) {
 		blobmsg_for_each_attr(cur, tb[OCI_LINUX_NAMESPACES], rem) {
