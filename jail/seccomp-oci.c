@@ -30,6 +30,8 @@
 #include <libubox/blobmsg.h>
 #include <libubox/blobmsg_json.h>
 
+#include <sys/syscall.h>
+
 #include "log.h"
 #include "seccomp-bpf.h"
 #include "seccomp-oci.h"
@@ -39,6 +41,28 @@
 #ifndef MAX_ERRNO
 #define MAX_ERRNO	4095
 #endif
+
+#ifndef SECCOMP_SET_MODE_FILTER
+#define SECCOMP_SET_MODE_FILTER 1
+#endif
+
+#ifndef SECCOMP_FILTER_FLAG_TSYNC
+#define SECCOMP_FILTER_FLAG_TSYNC		(1UL << 0)
+#endif
+
+#ifndef SECCOMP_FILTER_FLAG_LOG
+#define SECCOMP_FILTER_FLAG_LOG			(1UL << 1)
+#endif
+
+#ifndef SECCOMP_FILTER_FLAG_SPEC_ALLOW
+#define SECCOMP_FILTER_FLAG_SPEC_ALLOW		(1UL << 2)
+#endif
+
+#ifndef SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV
+#define SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV	(1UL << 5)
+#endif
+
+static unsigned long seccomp_filter_flags;
 
 static uint32_t resolve_action(char *actname)
 {
@@ -232,6 +256,25 @@ struct sock_fprog *parseOCIlinuxseccomp(struct blob_attr *msg)
 	}
 
 	default_policy = resolve_action(blobmsg_get_string(tb[OCI_LINUX_SECCOMP_DEFAULTACTION]));
+
+	seccomp_filter_flags = 0;
+	if (tb[OCI_LINUX_SECCOMP_FLAGS]) {
+		blobmsg_for_each_attr(cur, tb[OCI_LINUX_SECCOMP_FLAGS], rem) {
+			const char *flag = blobmsg_get_string(cur);
+			if (!strcmp(flag, "SECCOMP_FILTER_FLAG_LOG"))
+				seccomp_filter_flags |= SECCOMP_FILTER_FLAG_LOG;
+			else if (!strcmp(flag, "SECCOMP_FILTER_FLAG_SPEC_ALLOW"))
+				seccomp_filter_flags |= SECCOMP_FILTER_FLAG_SPEC_ALLOW;
+			else if (!strcmp(flag, "SECCOMP_FILTER_FLAG_TSYNC"))
+				seccomp_filter_flags |= SECCOMP_FILTER_FLAG_TSYNC;
+			else if (!strcmp(flag, "SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV"))
+				seccomp_filter_flags |= SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV;
+			else {
+				ERROR("seccomp: unknown filter flag %s\n", flag);
+				return NULL;
+			}
+		}
+	}
 
 	if (default_policy == SECCOMP_RET_ERRNO) {
 		uint32_t errnoret = EPERM;
@@ -469,7 +512,20 @@ int applyOCIlinuxseccomp(struct sock_fprog *prog)
 		goto errout;
 	}
 
-	if (prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, prog)) {
+	if (seccomp_filter_flags) {
+		long r = syscall(SYS_seccomp, SECCOMP_SET_MODE_FILTER,
+				 seccomp_filter_flags, prog);
+		if (r < 0) {
+			ERROR("seccomp(SET_MODE_FILTER, %#lx): %m\n", seccomp_filter_flags);
+			goto errout;
+		}
+		if (r > 0) {
+			ERROR("seccomp(SET_MODE_FILTER, %#lx) TSYNC failed at tid %ld\n",
+			      seccomp_filter_flags, r);
+			errno = EAGAIN;
+			goto errout;
+		}
+	} else if (prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, prog)) {
 		ERROR("prctl(PR_SET_SECCOMP) failed: %m\n");
 		goto errout;
 	}
