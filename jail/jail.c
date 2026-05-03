@@ -24,6 +24,9 @@
 #include <sys/ioctl.h>
 #include <sys/personality.h>
 #include <sys/syscall.h>
+#include <sys/socket.h>
+#include <linux/rtnetlink.h>
+#include <net/if.h>
 
 /* musl only defined 15 limit types, make sure all 16 are supported */
 #ifndef RLIMIT_RTTIME
@@ -159,6 +162,7 @@ static struct {
 	char *ocibundle;
 	bool immediately;
 	struct blob_attr *annotations;
+	struct blob_attr *netdevices;
 	int term_timeout;
 	struct {
 		bool set;
@@ -298,6 +302,7 @@ static void free_opts(bool parent) {
 	free(opts.uidmap);
 	free(opts.gidmap);
 	free(opts.annotations);
+	free(opts.netdevices);
 	free(opts.extroot);
 	free(opts.overlaydir);
 	free_hooklist(opts.hooks.prestart);
@@ -1417,6 +1422,139 @@ static int applyOCIprocessiopriority(void)
 	}
 
 	return 0;
+}
+
+static int move_netdev_to_ns(int netns_fd, const char *host_name, const char *new_name)
+{
+	struct {
+		struct nlmsghdr hdr;
+		struct ifinfomsg ifi;
+		char attrbuf[256];
+	} req = { 0 };
+	struct sockaddr_nl sa = { .nl_family = AF_NETLINK };
+	struct rtattr *rta;
+	int sock, ifindex;
+	char buf[4096];
+	ssize_t n;
+
+	int saved_err;
+
+	ifindex = if_nametoindex(host_name);
+	if (!ifindex) {
+		ERROR("netDevices: interface %s not found\n", host_name);
+		return ENODEV;
+	}
+
+	sock = socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_ROUTE);
+	if (sock < 0) {
+		ERROR("netDevices: socket(AF_NETLINK): %m\n");
+		return errno;
+	}
+	if (bind(sock, (struct sockaddr *)&sa, sizeof(sa)) < 0) {
+		saved_err = errno;
+		ERROR("netDevices: bind: %m\n");
+		close(sock);
+		errno = saved_err;
+		return saved_err;
+	}
+
+	req.hdr.nlmsg_len = NLMSG_LENGTH(sizeof(req.ifi));
+	req.hdr.nlmsg_type = RTM_NEWLINK;
+	req.hdr.nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK;
+	req.hdr.nlmsg_seq = 1;
+	req.ifi.ifi_family = AF_UNSPEC;
+	req.ifi.ifi_index = ifindex;
+
+	rta = (struct rtattr *)((char *)&req + NLMSG_ALIGN(req.hdr.nlmsg_len));
+	rta->rta_type = IFLA_NET_NS_FD;
+	rta->rta_len = RTA_LENGTH(sizeof(int));
+	memcpy(RTA_DATA(rta), &netns_fd, sizeof(int));
+	req.hdr.nlmsg_len = NLMSG_ALIGN(req.hdr.nlmsg_len) + RTA_ALIGN(rta->rta_len);
+
+	if (new_name) {
+		size_t namelen = strlen(new_name) + 1;
+		rta = (struct rtattr *)((char *)&req + NLMSG_ALIGN(req.hdr.nlmsg_len));
+		rta->rta_type = IFLA_IFNAME;
+		rta->rta_len = RTA_LENGTH(namelen);
+		memcpy(RTA_DATA(rta), new_name, namelen);
+		req.hdr.nlmsg_len = NLMSG_ALIGN(req.hdr.nlmsg_len) + RTA_ALIGN(rta->rta_len);
+	}
+
+	if (send(sock, &req, req.hdr.nlmsg_len, 0) < 0) {
+		saved_err = errno;
+		ERROR("netDevices: send: %m\n");
+		close(sock);
+		errno = saved_err;
+		return saved_err;
+	}
+
+	n = recv(sock, buf, sizeof(buf), 0);
+	saved_err = (n < 0) ? errno : 0;
+	close(sock);
+	if (n < 0) {
+		errno = saved_err;
+		ERROR("netDevices: recv: %m\n");
+		return saved_err;
+	}
+
+	if (n < (ssize_t)NLMSG_HDRLEN ||
+	    !NLMSG_OK((struct nlmsghdr *)buf, (size_t)n)) {
+		ERROR("netDevices: short or malformed nlmsg (%zd bytes)\n", n);
+		return EIO;
+	}
+
+	struct nlmsghdr *nh = (struct nlmsghdr *)buf;
+	if (nh->nlmsg_type == NLMSG_ERROR) {
+		struct nlmsgerr *err = NLMSG_DATA(nh);
+		if (err->error) {
+			ERROR("netDevices: kernel rejected move of %s: %s\n",
+			      host_name, strerror(-err->error));
+			return -err->error;
+		}
+	}
+
+	return 0;
+}
+
+static int move_netdevs_into_jail(pid_t pid)
+{
+	enum {
+		OCI_LINUX_NETDEVICES_NAME,
+		__OCI_LINUX_NETDEVICES_MAX,
+	};
+	static const struct blobmsg_policy policy[] = {
+		[OCI_LINUX_NETDEVICES_NAME] = { "name", BLOBMSG_TYPE_STRING },
+	};
+	struct blob_attr *cur, *tb[__OCI_LINUX_NETDEVICES_MAX];
+	char path[64];
+	int rem, netns_fd, ret = 0;
+
+	if (!opts.netdevices)
+		return 0;
+
+	snprintf(path, sizeof(path), "/proc/%d/ns/net", pid);
+	netns_fd = open(path, O_RDONLY | O_CLOEXEC);
+	if (netns_fd < 0) {
+		ERROR("netDevices: open(%s): %m\n", path);
+		return errno;
+	}
+
+	blobmsg_for_each_attr(cur, opts.netdevices, rem) {
+		const char *host_name = blobmsg_name(cur);
+		const char *new_name = NULL;
+
+		blobmsg_parse(policy, __OCI_LINUX_NETDEVICES_MAX, tb,
+			      blobmsg_data(cur), blobmsg_len(cur));
+		if (tb[OCI_LINUX_NETDEVICES_NAME])
+			new_name = blobmsg_get_string(tb[OCI_LINUX_NETDEVICES_NAME]);
+
+		ret = move_netdev_to_ns(netns_fd, host_name, new_name);
+		if (ret)
+			break;
+	}
+
+	close(netns_fd);
+	return ret;
 }
 
 #ifdef CLONE_NEWTIME
@@ -2649,6 +2787,7 @@ enum {
 	OCI_LINUX_ROOTFSPROPAGATION,
 	OCI_LINUX_PERSONALITY,
 	OCI_LINUX_TIMEOFFSETS,
+	OCI_LINUX_NETDEVICES,
 	__OCI_LINUX_MAX,
 };
 
@@ -2666,6 +2805,7 @@ static const struct blobmsg_policy oci_linux_policy[] = {
 	[OCI_LINUX_ROOTFSPROPAGATION] = { "rootfsPropagation", BLOBMSG_TYPE_STRING },
 	[OCI_LINUX_PERSONALITY] = { "personality", BLOBMSG_TYPE_TABLE },
 	[OCI_LINUX_TIMEOFFSETS] = { "timeOffsets", BLOBMSG_TYPE_TABLE },
+	[OCI_LINUX_NETDEVICES] = { "netDevices", BLOBMSG_TYPE_TABLE },
 };
 
 enum {
@@ -2739,6 +2879,9 @@ static int parseOCIlinux(struct blob_attr *msg)
 			return res;
 	}
 #endif
+
+	if (tb[OCI_LINUX_NETDEVICES])
+		opts.netdevices = blob_memdup(tb[OCI_LINUX_NETDEVICES]);
 
 	if (tb[OCI_LINUX_NAMESPACES]) {
 		blobmsg_for_each_attr(cur, tb[OCI_LINUX_NAMESPACES], rem) {
@@ -3657,6 +3800,11 @@ static void post_main(struct uloop_timeout *t)
 
 		if (opts.namespace & CLONE_NEWNET)
 			jail_network_start(parent_ctx, opts.name, jail_process.pid);
+
+		if (opts.netdevices &&
+		    ((opts.namespace & CLONE_NEWNET) || opts.setns.net != -1) &&
+		    move_netdevs_into_jail(jail_process.pid))
+			free_and_exit(-1);
 
 		if (jail_writepid(jail_process.pid)) {
 			ERROR("failed to write pidfile: %m\n");
