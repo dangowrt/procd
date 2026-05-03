@@ -582,6 +582,7 @@ enum {
 	OCI_LINUX_CGROUPS_CPU_SHARES,
 	OCI_LINUX_CGROUPS_CPU_PERIOD,
 	OCI_LINUX_CGROUPS_CPU_QUOTA,
+	OCI_LINUX_CGROUPS_CPU_BURST,
 	OCI_LINUX_CGROUPS_CPU_REALTIMERUNTIME,
 	OCI_LINUX_CGROUPS_CPU_REALTIMEPERIOD,
 	OCI_LINUX_CGROUPS_CPU_CPUS,
@@ -593,6 +594,7 @@ static const struct blobmsg_policy oci_linux_cgroups_cpu_policy[] = {
 	[OCI_LINUX_CGROUPS_CPU_SHARES] = { "shares", BLOBMSG_CAST_INT64 },
 	[OCI_LINUX_CGROUPS_CPU_PERIOD] = { "period", BLOBMSG_CAST_INT64 },
 	[OCI_LINUX_CGROUPS_CPU_QUOTA] = { "quota", BLOBMSG_CAST_INT64 }, /* signed int64! */
+	[OCI_LINUX_CGROUPS_CPU_BURST] = { "burst", BLOBMSG_CAST_INT64 },
 	[OCI_LINUX_CGROUPS_CPU_REALTIMEPERIOD] = { "realtimePeriod", BLOBMSG_CAST_INT64 },
 	[OCI_LINUX_CGROUPS_CPU_REALTIMERUNTIME] = { "realtimeRuntime", BLOBMSG_CAST_INT64 },
 	[OCI_LINUX_CGROUPS_CPU_CPUS] = { "cpus", BLOBMSG_TYPE_STRING },
@@ -641,6 +643,12 @@ static int parseOCIlinuxcgroups_legacy_cpu(struct blob_attr *msg)
 
 	if (tmp[0])
 		cgroups_set("cpu.max", tmp);
+
+	if (tb[OCI_LINUX_CGROUPS_CPU_BURST]) {
+		snprintf(tmp, sizeof(tmp), "%" PRIu64,
+			 blobmsg_cast_u64(tb[OCI_LINUX_CGROUPS_CPU_BURST]));
+		cgroups_set("cpu.max.burst", tmp);
+	}
 
 	if (tb[OCI_LINUX_CGROUPS_CPU_CPUS])
 		cgroups_set("cpuset.cpus", blobmsg_get_string(tb[OCI_LINUX_CGROUPS_CPU_CPUS]));
