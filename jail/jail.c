@@ -75,8 +75,6 @@
 #define STACK_SIZE	(1024 * 1024)
 #define OPT_ARGS	"cC:d:De:EfFG:h:ij:J:ln:NoO:pP:r:R:sS:uU:w:t:T:y"
 
-#define OCI_VERSION_STRING "1.0.2"
-
 struct hook_execvpe {
 	char *file;
 	char **argv;
@@ -1714,7 +1712,7 @@ static void post_start_hook(void)
 	if (opts.cwd && chdir(opts.cwd))
 		free_and_exit(EXIT_FAILURE);
 
-	if (opts.ociseccomp && applyOCIlinuxseccomp(opts.ociseccomp))
+	if (opts.ociseccomp && applyOCIlinuxseccomp(opts.ociseccomp, opts.name, opts.ocibundle))
 		free_and_exit(EXIT_FAILURE);
 
 	uloop_end();

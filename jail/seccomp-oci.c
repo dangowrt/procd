@@ -24,7 +24,11 @@
 #include <assert.h>
 #include <stddef.h>
 #include <stdlib.h>
+#include <string.h>
 #include <unistd.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <errno.h>
 
 #include <libubox/utils.h>
 #include <libubox/blobmsg.h>
@@ -33,6 +37,7 @@
 #include <sys/syscall.h>
 
 #include "log.h"
+#include "jail.h"
 #include "seccomp-bpf.h"
 #include "seccomp-oci.h"
 #include "../syscall-names.h"
@@ -62,7 +67,18 @@
 #define SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV	(1UL << 5)
 #endif
 
+#ifndef SECCOMP_FILTER_FLAG_NEW_LISTENER
+#define SECCOMP_FILTER_FLAG_NEW_LISTENER	(1UL << 3)
+#endif
+
+#ifndef SECCOMP_RET_USER_NOTIF
+#define SECCOMP_RET_USER_NOTIF	0x7fc00000U
+#endif
+
 static unsigned long seccomp_filter_flags;
+static char *seccomp_listener_path;
+static char *seccomp_listener_metadata;
+static bool seccomp_uses_notify;
 
 static uint32_t resolve_action(char *actname)
 {
@@ -84,6 +100,8 @@ static uint32_t resolve_action(char *actname)
 		return SECCOMP_RET_ALLOW;
 	else if (!strcmp(actname, "SCMP_ACT_LOG"))
 		return SECCOMP_RET_LOGALLOW;
+	else if (!strcmp(actname, "SCMP_ACT_NOTIFY"))
+		return SECCOMP_RET_USER_NOTIF;
 	else {
 		ERROR("unknown seccomp action %s\n", actname);
 		return SECCOMP_RET_KILL;
@@ -190,6 +208,8 @@ enum {
 	OCI_LINUX_SECCOMP_DEFAULTERRNORET,
 	OCI_LINUX_SECCOMP_ARCHITECTURES,
 	OCI_LINUX_SECCOMP_FLAGS,
+	OCI_LINUX_SECCOMP_LISTENERPATH,
+	OCI_LINUX_SECCOMP_LISTENERMETADATA,
 	OCI_LINUX_SECCOMP_SYSCALLS,
 	__OCI_LINUX_SECCOMP_MAX,
 };
@@ -199,6 +219,8 @@ static const struct blobmsg_policy oci_linux_seccomp_policy[] = {
 	[OCI_LINUX_SECCOMP_DEFAULTERRNORET] = { "defaultErrnoRet", BLOBMSG_TYPE_INT32 },
 	[OCI_LINUX_SECCOMP_ARCHITECTURES] = { "architectures", BLOBMSG_TYPE_ARRAY },
 	[OCI_LINUX_SECCOMP_FLAGS] = { "flags", BLOBMSG_TYPE_ARRAY },
+	[OCI_LINUX_SECCOMP_LISTENERPATH] = { "listenerPath", BLOBMSG_TYPE_STRING },
+	[OCI_LINUX_SECCOMP_LISTENERMETADATA] = { "listenerMetadata", BLOBMSG_TYPE_STRING },
 	[OCI_LINUX_SECCOMP_SYSCALLS] = { "syscalls", BLOBMSG_TYPE_ARRAY },
 };
 
@@ -256,6 +278,18 @@ struct sock_fprog *parseOCIlinuxseccomp(struct blob_attr *msg)
 	}
 
 	default_policy = resolve_action(blobmsg_get_string(tb[OCI_LINUX_SECCOMP_DEFAULTACTION]));
+
+	free(seccomp_listener_path);
+	free(seccomp_listener_metadata);
+	seccomp_listener_path = NULL;
+	seccomp_listener_metadata = NULL;
+	seccomp_uses_notify = (default_policy == SECCOMP_RET_USER_NOTIF);
+
+	if (tb[OCI_LINUX_SECCOMP_LISTENERPATH])
+		seccomp_listener_path = strdup(blobmsg_get_string(tb[OCI_LINUX_SECCOMP_LISTENERPATH]));
+
+	if (tb[OCI_LINUX_SECCOMP_LISTENERMETADATA])
+		seccomp_listener_metadata = strdup(blobmsg_get_string(tb[OCI_LINUX_SECCOMP_LISTENERMETADATA]));
 
 	seccomp_filter_flags = 0;
 	if (tb[OCI_LINUX_SECCOMP_FLAGS]) {
@@ -381,6 +415,8 @@ struct sock_fprog *parseOCIlinuxseccomp(struct blob_attr *msg)
 			      tbn, blobmsg_data(cur), blobmsg_len(cur));
 		action = resolve_action(blobmsg_get_string(
 				tbn[OCI_LINUX_SECCOMP_SYSCALLS_ACTION]));
+		if (action == SECCOMP_RET_USER_NOTIF)
+			seccomp_uses_notify = true;
 		if (tbn[OCI_LINUX_SECCOMP_SYSCALLS_ERRNORET]) {
 			uint32_t errnoret;
 
@@ -505,14 +541,127 @@ errout2:
 }
 
 
-int applyOCIlinuxseccomp(struct sock_fprog *prog)
+static int send_seccomp_listener_fd(int listener_fd, const char *container_id,
+				    const char *bundle_path)
 {
+	struct sockaddr_un addr = { .sun_family = AF_UNIX };
+	struct blob_buf bb = { 0 };
+	void *fds_arr, *state;
+	struct msghdr msg = { 0 };
+	struct iovec iov;
+	struct cmsghdr *cmsg;
+	char cmsgbuf[CMSG_SPACE(sizeof(int))];
+	char *json;
+	int sock;
+	int ret = 0;
+	int saved_err;
+
+	if (strlen(seccomp_listener_path) >= sizeof(addr.sun_path)) {
+		ERROR("seccomp: listenerPath too long: %s\n", seccomp_listener_path);
+		return ENAMETOOLONG;
+	}
+
+	blob_buf_init(&bb, 0);
+	blobmsg_add_string(&bb, "ociVersion", OCI_VERSION_STRING);
+	fds_arr = blobmsg_open_array(&bb, "fds");
+	blobmsg_add_string(&bb, NULL, "seccompFd");
+	blobmsg_close_array(&bb, fds_arr);
+	blobmsg_add_u32(&bb, "pid", getpid());
+	if (seccomp_listener_metadata)
+		blobmsg_add_string(&bb, "metadata", seccomp_listener_metadata);
+	state = blobmsg_open_table(&bb, "state");
+	blobmsg_add_string(&bb, "ociVersion", OCI_VERSION_STRING);
+	if (container_id)
+		blobmsg_add_string(&bb, "id", container_id);
+	blobmsg_add_string(&bb, "status", "creating");
+	blobmsg_add_u32(&bb, "pid", getpid());
+	if (bundle_path)
+		blobmsg_add_string(&bb, "bundle", bundle_path);
+	blobmsg_close_table(&bb, state);
+
+	json = blobmsg_format_json(bb.head, true);
+	if (!json) {
+		blob_buf_free(&bb);
+		return ENOMEM;
+	}
+
+	sock = socket(AF_UNIX, SOCK_STREAM, 0);
+	if (sock < 0) {
+		ret = errno;
+		ERROR("socket(AF_UNIX): %m\n");
+		goto out;
+	}
+
+	memcpy(addr.sun_path, seccomp_listener_path, strlen(seccomp_listener_path) + 1);
+	if (connect(sock, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+		ret = errno;
+		ERROR("connect(%s): %m\n", seccomp_listener_path);
+		saved_err = ret;
+		close(sock);
+		ret = saved_err;
+		goto out;
+	}
+
+	iov.iov_base = json;
+	iov.iov_len = strlen(json);
+	msg.msg_iov = &iov;
+	msg.msg_iovlen = 1;
+	msg.msg_control = cmsgbuf;
+	msg.msg_controllen = sizeof(cmsgbuf);
+	cmsg = CMSG_FIRSTHDR(&msg);
+	cmsg->cmsg_level = SOL_SOCKET;
+	cmsg->cmsg_type = SCM_RIGHTS;
+	cmsg->cmsg_len = CMSG_LEN(sizeof(int));
+	memcpy(CMSG_DATA(cmsg), &listener_fd, sizeof(int));
+
+	if (sendmsg(sock, &msg, 0) < 0) {
+		ret = errno;
+		ERROR("sendmsg(%s): %m\n", seccomp_listener_path);
+	}
+
+	saved_err = ret;
+	close(sock);
+	ret = saved_err;
+out:
+	free(json);
+	blob_buf_free(&bb);
+	return ret;
+}
+
+int applyOCIlinuxseccomp(struct sock_fprog *prog, const char *container_id,
+			 const char *bundle_path)
+{
+	int listener_fd = -1;
+
 	if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0)) {
 		ERROR("prctl(PR_SET_NO_NEW_PRIVS) failed: %m\n");
 		goto errout;
 	}
 
-	if (seccomp_filter_flags) {
+	if (seccomp_uses_notify) {
+		if (!seccomp_listener_path) {
+			ERROR("seccomp: SCMP_ACT_NOTIFY used without listenerPath\n");
+			errno = EINVAL;
+			goto errout;
+		}
+
+		listener_fd = syscall(SYS_seccomp, SECCOMP_SET_MODE_FILTER,
+				      seccomp_filter_flags | SECCOMP_FILTER_FLAG_NEW_LISTENER,
+				      prog);
+		if (listener_fd < 0) {
+			ERROR("seccomp(SET_MODE_FILTER|NEW_LISTENER): %m\n");
+			goto errout;
+		}
+
+		if (send_seccomp_listener_fd(listener_fd, container_id, bundle_path)) {
+			int saved_err = errno;
+			close(listener_fd);
+			errno = saved_err;
+			goto errout;
+		}
+
+		close(listener_fd);
+	} else if (seccomp_filter_flags) {
 		long r = syscall(SYS_seccomp, SECCOMP_SET_MODE_FILTER,
 				 seccomp_filter_flags, prog);
 		if (r < 0) {
