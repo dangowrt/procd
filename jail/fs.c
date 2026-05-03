@@ -20,11 +20,17 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <linux/limits.h>
+#include <linux/mount.h>
+#include <sched.h>
+#include <signal.h>
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/mman.h>
+#include <sys/syscall.h>
+#include <sys/wait.h>
 #include <unistd.h>
 #include <libgen.h>
 
@@ -41,6 +47,167 @@
 
 #define UJAIL_NOAFILE "/tmp/.ujailnoafile"
 
+#ifndef MOUNT_ATTR_IDMAP
+#define MOUNT_ATTR_IDMAP 0x00100000
+#endif
+
+int sys_open_tree(int dfd, const char *path, unsigned int flags)
+{
+	return syscall(SYS_open_tree, dfd, path, flags);
+}
+
+int sys_move_mount(int from_dfd, const char *from_path, int to_dfd,
+		   const char *to_path, unsigned int flags)
+{
+	return syscall(SYS_move_mount, from_dfd, from_path, to_dfd, to_path, flags);
+}
+
+int sys_mount_setattr(int dfd, const char *path, unsigned int flags,
+		      struct mount_attr *attr, size_t size)
+{
+	return syscall(SYS_mount_setattr, dfd, path, flags, attr, size);
+}
+
+static int write_mappings_file(pid_t pid, const char *which, struct blob_attr *mappings)
+{
+	enum {
+		OCI_LINUX_UIDGIDMAP_CONTAINERID,
+		OCI_LINUX_UIDGIDMAP_HOSTID,
+		OCI_LINUX_UIDGIDMAP_SIZE,
+		__OCI_LINUX_UIDGIDMAP_MAX,
+	};
+	static const struct blobmsg_policy policy[] = {
+		[OCI_LINUX_UIDGIDMAP_CONTAINERID] = { "containerID", BLOBMSG_TYPE_INT32 },
+		[OCI_LINUX_UIDGIDMAP_HOSTID] = { "hostID", BLOBMSG_TYPE_INT32 },
+		[OCI_LINUX_UIDGIDMAP_SIZE] = { "size", BLOBMSG_TYPE_INT32 },
+	};
+	struct blob_attr *tb[__OCI_LINUX_UIDGIDMAP_MAX];
+	struct blob_attr *cur;
+	char path[64];
+	char *buf = NULL;
+	size_t buflen = 0;
+	FILE *mem;
+	ssize_t w;
+	int rem, fd, ret = 0, saved_err;
+
+	mem = open_memstream(&buf, &buflen);
+	if (!mem)
+		return errno;
+
+	blobmsg_for_each_attr(cur, mappings, rem) {
+		blobmsg_parse(policy, __OCI_LINUX_UIDGIDMAP_MAX, tb,
+			      blobmsg_data(cur), blobmsg_len(cur));
+		if (!tb[OCI_LINUX_UIDGIDMAP_CONTAINERID] ||
+		    !tb[OCI_LINUX_UIDGIDMAP_HOSTID] ||
+		    !tb[OCI_LINUX_UIDGIDMAP_SIZE]) {
+			fclose(mem);
+			free(buf);
+			return EINVAL;
+		}
+		fprintf(mem, "%u %u %u\n",
+			blobmsg_get_u32(tb[OCI_LINUX_UIDGIDMAP_CONTAINERID]),
+			blobmsg_get_u32(tb[OCI_LINUX_UIDGIDMAP_HOSTID]),
+			blobmsg_get_u32(tb[OCI_LINUX_UIDGIDMAP_SIZE]));
+	}
+	fclose(mem);
+
+	if (!buflen) {
+		free(buf);
+		return 0;
+	}
+
+	snprintf(path, sizeof(path), "/proc/%d/%s", pid, which);
+	fd = open(path, O_WRONLY | O_CLOEXEC);
+	if (fd < 0) {
+		ret = errno;
+		free(buf);
+		return ret;
+	}
+
+	w = write(fd, buf, buflen);
+	if (w < 0)
+		ret = errno;
+	else if ((size_t)w != buflen)
+		ret = EIO;
+
+	saved_err = ret;
+	close(fd);
+	free(buf);
+	return saved_err;
+}
+
+int build_userns_fd(struct blob_attr *uidmappings, struct blob_attr *gidmappings)
+{
+	int sync[2];
+	pid_t pid;
+	char path[64];
+	char buf;
+	int fd = -1;
+	int ret, saved_err = 0;
+
+	if (socketpair(AF_UNIX, SOCK_STREAM, 0, sync) < 0)
+		return -errno;
+
+	pid = fork();
+	if (pid < 0) {
+		ret = -errno;
+		close(sync[0]);
+		close(sync[1]);
+		return ret;
+	}
+
+	if (pid == 0) {
+		close(sync[0]);
+		if (unshare(CLONE_NEWUSER) < 0)
+			_exit(EXIT_FAILURE);
+		if (send(sync[1], "R", 1, MSG_NOSIGNAL) != 1)
+			_exit(EXIT_FAILURE);
+		if (read(sync[1], &buf, 1) < 0) {
+			/* nothing — wait barrier, parent writes or closes */
+		}
+		_exit(EXIT_SUCCESS);
+	}
+
+	close(sync[1]);
+	if (read(sync[0], &buf, 1) != 1 || buf != 'R') {
+		saved_err = EIO;
+		goto out;
+	}
+
+	if (uidmappings && (ret = write_mappings_file(pid, "uid_map", uidmappings))) {
+		saved_err = ret;
+		goto out;
+	}
+	if (gidmappings) {
+		int gfd;
+		snprintf(path, sizeof(path), "/proc/%d/setgroups", pid);
+		gfd = open(path, O_WRONLY | O_CLOEXEC);
+		if (gfd >= 0) {
+			(void)!write(gfd, "deny", 4);
+			close(gfd);
+		}
+		if ((ret = write_mappings_file(pid, "gid_map", gidmappings))) {
+			saved_err = ret;
+			goto out;
+		}
+	}
+
+	snprintf(path, sizeof(path), "/proc/%d/ns/user", pid);
+	fd = open(path, O_RDONLY | O_CLOEXEC);
+	if (fd < 0)
+		saved_err = errno;
+
+out:
+	(void)send(sync[0], "X", 1, MSG_NOSIGNAL);
+	close(sync[0]);
+	waitpid(pid, NULL, 0);
+	if (fd < 0) {
+		errno = saved_err ? saved_err : EIO;
+		return -errno;
+	}
+	return fd;
+}
+
 struct mount {
 	struct avl_node avl;
 	const char *source;
@@ -51,6 +218,8 @@ struct mount {
 	const char *optstr;
 	int error;
 	bool inner;
+	bool idmap;
+	bool idmap_recursive;
 	struct blob_attr *uidmappings;
 	struct blob_attr *gidmappings;
 };
