@@ -40,6 +40,8 @@ static uint32_t resolve_action(char *actname)
 {
 	if (!strcmp(actname, "SCMP_ACT_KILL"))
 		return SECCOMP_RET_KILL;
+	else if (!strcmp(actname, "SCMP_ACT_KILL_THREAD"))
+		return SECCOMP_RET_KILL;
 	else if (!strcmp(actname, "SCMP_ACT_KILL_PROCESS"))
 		return SECCOMP_RET_KILLPROCESS;
 	else if (!strcmp(actname, "SCMP_ACT_TRAP"))
