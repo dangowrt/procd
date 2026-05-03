@@ -22,6 +22,7 @@
 #include <sys/stat.h>
 #include <sys/sysmacros.h>
 #include <sys/ioctl.h>
+#include <sys/personality.h>
 
 /* musl only defined 15 limit types, make sure all 16 are supported */
 #ifndef RLIMIT_RTTIME
@@ -2243,6 +2244,7 @@ enum {
 	OCI_LINUX_MASKEDPATHS,
 	OCI_LINUX_READONLYPATHS,
 	OCI_LINUX_ROOTFSPROPAGATION,
+	OCI_LINUX_PERSONALITY,
 	__OCI_LINUX_MAX,
 };
 
@@ -2258,7 +2260,55 @@ static const struct blobmsg_policy oci_linux_policy[] = {
 	[OCI_LINUX_MASKEDPATHS] = { "maskedPaths", BLOBMSG_TYPE_ARRAY },
 	[OCI_LINUX_READONLYPATHS] = { "readonlyPaths", BLOBMSG_TYPE_ARRAY },
 	[OCI_LINUX_ROOTFSPROPAGATION] = { "rootfsPropagation", BLOBMSG_TYPE_STRING },
+	[OCI_LINUX_PERSONALITY] = { "personality", BLOBMSG_TYPE_TABLE },
 };
+
+enum {
+	OCI_LINUX_PERSONALITY_DOMAIN,
+	OCI_LINUX_PERSONALITY_FLAGS,
+	__OCI_LINUX_PERSONALITY_MAX,
+};
+
+static const struct blobmsg_policy oci_linux_personality_policy[] = {
+	[OCI_LINUX_PERSONALITY_DOMAIN] = { "domain", BLOBMSG_TYPE_STRING },
+	[OCI_LINUX_PERSONALITY_FLAGS] = { "flags", BLOBMSG_TYPE_ARRAY },
+};
+
+static int parseOCIlinuxpersonality(struct blob_attr *msg)
+{
+	struct blob_attr *tb[__OCI_LINUX_PERSONALITY_MAX];
+	const char *domain;
+	unsigned long requested, current;
+
+	blobmsg_parse(oci_linux_personality_policy, __OCI_LINUX_PERSONALITY_MAX, tb,
+		      blobmsg_data(msg), blobmsg_len(msg));
+
+	if (tb[OCI_LINUX_PERSONALITY_FLAGS] &&
+	    blobmsg_len(tb[OCI_LINUX_PERSONALITY_FLAGS])) {
+		ERROR("linux.personality.flags is not supported\n");
+		return ENOTSUP;
+	}
+
+	if (!tb[OCI_LINUX_PERSONALITY_DOMAIN])
+		return ENODATA;
+
+	domain = blobmsg_get_string(tb[OCI_LINUX_PERSONALITY_DOMAIN]);
+	if (!strcmp(domain, "LINUX"))
+		requested = PER_LINUX;
+	else if (!strcmp(domain, "LINUX32"))
+		requested = PER_LINUX32;
+	else
+		return EINVAL;
+
+	current = personality(0xFFFFFFFF) & PER_MASK;
+	if (requested != current) {
+		ERROR("linux.personality '%s' differs from current; cross-personality execution is not supported\n",
+		      domain);
+		return ENOTSUP;
+	}
+
+	return 0;
+}
 
 static int parseOCIlinux(struct blob_attr *msg)
 {
@@ -2270,6 +2320,12 @@ static int parseOCIlinux(struct blob_attr *msg)
 	char cgfullpath[256] = "/sys/fs/cgroup";
 
 	blobmsg_parse(oci_linux_policy, __OCI_LINUX_MAX, tb, blobmsg_data(msg), blobmsg_len(msg));
+
+	if (tb[OCI_LINUX_PERSONALITY]) {
+		res = parseOCIlinuxpersonality(tb[OCI_LINUX_PERSONALITY]);
+		if (res)
+			return res;
+	}
 
 	if (tb[OCI_LINUX_NAMESPACES]) {
 		blobmsg_for_each_attr(cur, tb[OCI_LINUX_NAMESPACES], rem) {
