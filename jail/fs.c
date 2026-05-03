@@ -419,6 +419,7 @@ int parseOCImount(struct blob_attr *msg)
 	unsigned long mount_flags = 0;
 	unsigned long propagation_flags = 0;
 	char *mount_data = NULL;
+	char *destination, *abs_destination = NULL;
 	int ret, err = -1;
 
 	blobmsg_parse(oci_mount_policy, __OCI_MOUNT_MAX, tb, blobmsg_data(msg), blobmsg_len(msg));
@@ -432,11 +433,21 @@ int parseOCImount(struct blob_attr *msg)
 			return ret;
 	}
 
+	destination = blobmsg_get_string(tb[OCI_MOUNT_DESTINATION]);
+	if (destination[0] != '/') {
+		if (asprintf(&abs_destination, "/%s", destination) < 0) {
+			free(mount_data);
+			return ENOMEM;
+		}
+		destination = abs_destination;
+	}
+
 	ret = add_mount(tb[OCI_MOUNT_SOURCE] ? blobmsg_get_string(tb[OCI_MOUNT_SOURCE]) : NULL,
-		  blobmsg_get_string(tb[OCI_MOUNT_DESTINATION]),
+		  destination,
 		  tb[OCI_MOUNT_TYPE] ? blobmsg_get_string(tb[OCI_MOUNT_TYPE]) : NULL,
 		  mount_flags, propagation_flags, mount_data, err);
 
+	free(abs_destination);
 	if (mount_data)
 		free(mount_data);
 
