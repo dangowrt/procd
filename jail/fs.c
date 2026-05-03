@@ -51,6 +51,22 @@
 #define MOUNT_ATTR_IDMAP 0x00100000
 #endif
 
+#ifndef MOUNT_ATTR__ATIME
+#define MOUNT_ATTR__ATIME	0x00000070
+#endif
+#ifndef MOUNT_ATTR_RELATIME
+#define MOUNT_ATTR_RELATIME	0x00000000
+#endif
+#ifndef MOUNT_ATTR_NOATIME
+#define MOUNT_ATTR_NOATIME	0x00000010
+#endif
+#ifndef MOUNT_ATTR_STRICTATIME
+#define MOUNT_ATTR_STRICTATIME	0x00000020
+#endif
+#ifndef MOUNT_ATTR_NODIRATIME
+#define MOUNT_ATTR_NODIRATIME	0x00000080
+#endif
+
 int sys_open_tree(int dfd, const char *path, unsigned int flags)
 {
 	return syscall(SYS_open_tree, dfd, path, flags);
@@ -448,7 +464,7 @@ struct mount_opt {
 #define MS_LAZYTIME (1 << 25)
 #endif
 
-static int parseOCImountopts(struct blob_attr *msg, unsigned long *mount_flags, unsigned long *propagation_flags, char **mount_data, int *error)
+static int parseOCImountopts(struct blob_attr *msg, unsigned long *mount_flags, unsigned long *propagation_flags, char **mount_data, int *error, bool *idmap, bool *idmap_recursive)
 {
 	struct blob_attr *cur;
 	int rem;
@@ -459,9 +475,19 @@ static int parseOCImountopts(struct blob_attr *msg, unsigned long *mount_flags, 
 	size_t len = 0;
 	struct mount_opt *opt, *tmpopt;
 
+	*idmap = false;
+	*idmap_recursive = false;
+
 	blobmsg_for_each_attr(cur, msg, rem) {
 		tmp = blobmsg_get_string(cur);
-		if (!strcmp("ro", tmp))
+		if (!strcmp("idmap", tmp)) {
+			*idmap = true;
+			continue;
+		} else if (!strcmp("ridmap", tmp)) {
+			*idmap = true;
+			*idmap_recursive = true;
+			continue;
+		} else if (!strcmp("ro", tmp))
 			mf |= MS_RDONLY;
 		else if (!strcmp("rw", tmp))
 			mf &= ~MS_RDONLY;
@@ -595,6 +621,7 @@ int parseOCImount(struct blob_attr *msg)
 	unsigned long propagation_flags = 0;
 	char *mount_data = NULL;
 	char *destination, *abs_destination = NULL;
+	bool idmap = false, idmap_recursive = false;
 	int ret, err = -1;
 
 	blobmsg_parse(oci_mount_policy, __OCI_MOUNT_MAX, tb, blobmsg_data(msg), blobmsg_len(msg));
@@ -603,7 +630,7 @@ int parseOCImount(struct blob_attr *msg)
 		return EINVAL;
 
 	if (tb[OCI_MOUNT_OPTIONS]) {
-		ret = parseOCImountopts(tb[OCI_MOUNT_OPTIONS], &mount_flags, &propagation_flags, &mount_data, &err);
+		ret = parseOCImountopts(tb[OCI_MOUNT_OPTIONS], &mount_flags, &propagation_flags, &mount_data, &err, &idmap, &idmap_recursive);
 		if (ret)
 			return ret;
 	}
@@ -622,9 +649,11 @@ int parseOCImount(struct blob_attr *msg)
 		  tb[OCI_MOUNT_TYPE] ? blobmsg_get_string(tb[OCI_MOUNT_TYPE]) : NULL,
 		  mount_flags, propagation_flags, mount_data, err);
 
-	if (!ret && (tb[OCI_MOUNT_UIDMAPPINGS] || tb[OCI_MOUNT_GIDMAPPINGS])) {
+	if (!ret && (idmap || tb[OCI_MOUNT_UIDMAPPINGS] || tb[OCI_MOUNT_GIDMAPPINGS])) {
 		struct mount *m = avl_find_element(&mounts, destination, m, avl);
 		if (m) {
+			m->idmap = idmap || tb[OCI_MOUNT_UIDMAPPINGS] || tb[OCI_MOUNT_GIDMAPPINGS];
+			m->idmap_recursive = idmap_recursive;
 			if (tb[OCI_MOUNT_UIDMAPPINGS]) {
 				free(m->uidmappings);
 				m->uidmappings = blob_memdup(tb[OCI_MOUNT_UIDMAPPINGS]);
@@ -664,6 +693,117 @@ static void build_noafile(void) {
 	return;
 }
 
+static int do_idmap_mount(const char *root, struct mount *m)
+{
+	char target[PATH_MAX];
+	struct mount_attr attr = { 0 };
+	struct stat s;
+	int treefd, userns_fd, ret = m->error;
+	unsigned int open_flags = OPEN_TREE_CLONE | OPEN_TREE_CLOEXEC;
+	unsigned int setattr_flags = AT_EMPTY_PATH;
+
+	if (!m->source || m->source == (void *)(-1)) {
+		ERROR("idmap mount %s requires a source\n", m->target);
+		return m->error;
+	}
+
+	if (m->idmap_recursive) {
+		open_flags |= AT_RECURSIVE;
+		setattr_flags |= AT_RECURSIVE;
+	}
+
+	userns_fd = build_userns_fd(m->uidmappings, m->gidmappings);
+	if (userns_fd < 0) {
+		ERROR("build_userns_fd: %s\n", strerror(-userns_fd));
+		return m->error;
+	}
+
+	snprintf(target, sizeof(target), "%s%s", root, m->target);
+
+	if (stat(m->source, &s)) {
+		if (m->error)
+			ERROR("stat(%s) failed: %m\n", m->source);
+		goto out_close;
+	}
+
+	if (S_ISDIR(s.st_mode)) {
+		mkdir_p(target, 0755);
+	} else {
+		int fd;
+		mkdir_p(dirname(strdupa(target)), 0755);
+		snprintf(target, sizeof(target), "%s%s", root, m->target);
+		fd = open(target, O_CREAT | O_WRONLY | O_TRUNC, 0644);
+		if (fd >= 0)
+			close(fd);
+	}
+
+	treefd = sys_open_tree(AT_FDCWD, m->source, open_flags);
+	if (treefd < 0) {
+		if (m->error)
+			ERROR("open_tree(%s): %m\n", m->source);
+		goto out_close;
+	}
+
+	attr.attr_set = MOUNT_ATTR_IDMAP;
+	if (m->mountflags & MS_RDONLY)
+		attr.attr_set |= MOUNT_ATTR_RDONLY;
+	if (m->mountflags & MS_NOSUID)
+		attr.attr_set |= MOUNT_ATTR_NOSUID;
+	if (m->mountflags & MS_NODEV)
+		attr.attr_set |= MOUNT_ATTR_NODEV;
+	if (m->mountflags & MS_NOEXEC)
+		attr.attr_set |= MOUNT_ATTR_NOEXEC;
+	if (m->mountflags & MS_NODIRATIME)
+		attr.attr_set |= MOUNT_ATTR_NODIRATIME;
+	if (m->mountflags & (MS_NOATIME | MS_RELATIME | MS_STRICTATIME)) {
+		attr.attr_clr |= MOUNT_ATTR__ATIME;
+		if (m->mountflags & MS_NOATIME)
+			attr.attr_set |= MOUNT_ATTR_NOATIME;
+		else if (m->mountflags & MS_STRICTATIME)
+			attr.attr_set |= MOUNT_ATTR_STRICTATIME;
+		else
+			attr.attr_set |= MOUNT_ATTR_RELATIME;
+	}
+	if (m->mountflags & ~(MS_RDONLY | MS_NOSUID | MS_NODEV | MS_NOEXEC |
+			      MS_NODIRATIME | MS_NOATIME | MS_RELATIME |
+			      MS_STRICTATIME | MS_BIND | MS_REC))
+		WARNING("idmap mount %s: dropping unsupported mountflags %#lx\n",
+			m->target,
+			m->mountflags & ~(MS_RDONLY | MS_NOSUID | MS_NODEV | MS_NOEXEC |
+					  MS_NODIRATIME | MS_NOATIME | MS_RELATIME |
+					  MS_STRICTATIME | MS_BIND | MS_REC));
+	attr.userns_fd = userns_fd;
+
+	if (sys_mount_setattr(treefd, "", setattr_flags, &attr, sizeof(attr)) < 0) {
+		if (m->error)
+			ERROR("mount_setattr(IDMAP, %s): %m\n", m->source);
+		close(treefd);
+		goto out_close;
+	}
+
+	if (sys_move_mount(treefd, "", AT_FDCWD, target, MOVE_MOUNT_F_EMPTY_PATH) < 0) {
+		if (m->error)
+			ERROR("move_mount(%s -> %s): %m\n", m->source, target);
+		close(treefd);
+		goto out_close;
+	}
+
+	if (m->propflags && mount("none", target, "none", m->propflags, NULL)) {
+		if (m->error)
+			ERROR("mount(propagation %#lx, %s): %m\n", m->propflags, target);
+		close(treefd);
+		goto out_close;
+	}
+
+	DEBUG("idmap mount %s %s\n", m->source, target);
+	close(treefd);
+	ret = 0;
+
+out_close:
+	close(userns_fd);
+	return ret;
+}
+
 int mount_all(const char *jailroot) {
 	struct library *l;
 	struct mount *m;
@@ -673,10 +813,15 @@ int mount_all(const char *jailroot) {
 	avl_for_each_element(&libraries, l, avl)
 		add_mount_bind(l->path, 1, -1);
 
-	avl_for_each_element(&mounts, m, avl)
-		if (do_mount(jailroot, m->source, m->target, m->filesystemtype, m->mountflags,
-			     m->propflags, m->optstr, m->error, m->inner))
+	avl_for_each_element(&mounts, m, avl) {
+		if (m->idmap) {
+			if (do_idmap_mount(jailroot, m))
+				return -1;
+		} else if (do_mount(jailroot, m->source, m->target, m->filesystemtype, m->mountflags,
+				    m->propflags, m->optstr, m->error, m->inner)) {
 			return -1;
+		}
+	}
 
 	return 0;
 }
