@@ -23,6 +23,7 @@
 #include <sys/sysmacros.h>
 #include <sys/ioctl.h>
 #include <sys/personality.h>
+#include <sys/syscall.h>
 
 /* musl only defined 15 limit types, make sure all 16 are supported */
 #ifndef RLIMIT_RTTIME
@@ -159,6 +160,16 @@ static struct {
 	bool immediately;
 	struct blob_attr *annotations;
 	int term_timeout;
+	struct {
+		bool set;
+		uint32_t policy;
+		uint64_t flags;
+		int32_t nice;
+		uint32_t priority;
+		uint64_t runtime;
+		uint64_t deadline;
+		uint64_t period;
+	} scheduler;
 } opts;
 
 static struct blob_buf ocibuf;
@@ -1175,6 +1186,151 @@ static void signals_init(void)
 	}
 }
 
+enum {
+	OCI_PROCESS_SCHEDULER_POLICY,
+	OCI_PROCESS_SCHEDULER_NICE,
+	OCI_PROCESS_SCHEDULER_PRIORITY,
+	OCI_PROCESS_SCHEDULER_FLAGS,
+	OCI_PROCESS_SCHEDULER_RUNTIME,
+	OCI_PROCESS_SCHEDULER_DEADLINE,
+	OCI_PROCESS_SCHEDULER_PERIOD,
+	__OCI_PROCESS_SCHEDULER_MAX,
+};
+
+static const struct blobmsg_policy oci_process_scheduler_policy[] = {
+	[OCI_PROCESS_SCHEDULER_POLICY] = { "policy", BLOBMSG_TYPE_STRING },
+	[OCI_PROCESS_SCHEDULER_NICE] = { "nice", BLOBMSG_TYPE_INT32 },
+	[OCI_PROCESS_SCHEDULER_PRIORITY] = { "priority", BLOBMSG_TYPE_INT32 },
+	[OCI_PROCESS_SCHEDULER_FLAGS] = { "flags", BLOBMSG_TYPE_ARRAY },
+	[OCI_PROCESS_SCHEDULER_RUNTIME] = { "runtime", BLOBMSG_CAST_INT64 },
+	[OCI_PROCESS_SCHEDULER_DEADLINE] = { "deadline", BLOBMSG_CAST_INT64 },
+	[OCI_PROCESS_SCHEDULER_PERIOD] = { "period", BLOBMSG_CAST_INT64 },
+};
+
+#ifndef SCHED_DEADLINE
+#define SCHED_DEADLINE 6
+#endif
+
+#ifndef SCHED_FLAG_RESET_ON_FORK
+#define SCHED_FLAG_RESET_ON_FORK 0x01
+#endif
+
+#ifndef SCHED_FLAG_RECLAIM
+#define SCHED_FLAG_RECLAIM 0x02
+#endif
+
+#ifndef SCHED_FLAG_DL_OVERRUN
+#define SCHED_FLAG_DL_OVERRUN 0x04
+#endif
+
+struct procd_sched_attr {
+	uint32_t size;
+	uint32_t sched_policy;
+	uint64_t sched_flags;
+	int32_t  sched_nice;
+	uint32_t sched_priority;
+	uint64_t sched_runtime;
+	uint64_t sched_deadline;
+	uint64_t sched_period;
+};
+
+static int parseOCIprocessscheduler(struct blob_attr *msg)
+{
+	struct blob_attr *tb[__OCI_PROCESS_SCHEDULER_MAX];
+	struct blob_attr *cur;
+	const char *policy;
+	int rem;
+
+	blobmsg_parse(oci_process_scheduler_policy, __OCI_PROCESS_SCHEDULER_MAX, tb,
+		      blobmsg_data(msg), blobmsg_len(msg));
+
+	if (!tb[OCI_PROCESS_SCHEDULER_POLICY])
+		return ENODATA;
+
+	policy = blobmsg_get_string(tb[OCI_PROCESS_SCHEDULER_POLICY]);
+	if (!strcmp(policy, "SCHED_OTHER"))
+		opts.scheduler.policy = SCHED_OTHER;
+	else if (!strcmp(policy, "SCHED_FIFO"))
+		opts.scheduler.policy = SCHED_FIFO;
+	else if (!strcmp(policy, "SCHED_RR"))
+		opts.scheduler.policy = SCHED_RR;
+	else if (!strcmp(policy, "SCHED_BATCH"))
+		opts.scheduler.policy = SCHED_BATCH;
+	else if (!strcmp(policy, "SCHED_IDLE"))
+		opts.scheduler.policy = SCHED_IDLE;
+	else if (!strcmp(policy, "SCHED_DEADLINE"))
+		opts.scheduler.policy = SCHED_DEADLINE;
+	else
+		return EINVAL;
+
+	if (tb[OCI_PROCESS_SCHEDULER_NICE])
+		opts.scheduler.nice = blobmsg_get_u32(tb[OCI_PROCESS_SCHEDULER_NICE]);
+
+	if (tb[OCI_PROCESS_SCHEDULER_PRIORITY]) {
+		int32_t prio = (int32_t)blobmsg_get_u32(tb[OCI_PROCESS_SCHEDULER_PRIORITY]);
+
+		if (prio < 0) {
+			ERROR("scheduler: priority %d out of range\n", prio);
+			return EINVAL;
+		}
+		if ((opts.scheduler.policy == SCHED_FIFO || opts.scheduler.policy == SCHED_RR) &&
+		    (prio < 1 || prio > 99)) {
+			ERROR("scheduler: priority %d outside 1..99 for FIFO/RR\n", prio);
+			return EINVAL;
+		}
+		opts.scheduler.priority = prio;
+	}
+
+	if (tb[OCI_PROCESS_SCHEDULER_RUNTIME])
+		opts.scheduler.runtime = blobmsg_cast_u64(tb[OCI_PROCESS_SCHEDULER_RUNTIME]);
+
+	if (tb[OCI_PROCESS_SCHEDULER_DEADLINE])
+		opts.scheduler.deadline = blobmsg_cast_u64(tb[OCI_PROCESS_SCHEDULER_DEADLINE]);
+
+	if (tb[OCI_PROCESS_SCHEDULER_PERIOD])
+		opts.scheduler.period = blobmsg_cast_u64(tb[OCI_PROCESS_SCHEDULER_PERIOD]);
+
+	if (tb[OCI_PROCESS_SCHEDULER_FLAGS]) {
+		if (blobmsg_check_array(tb[OCI_PROCESS_SCHEDULER_FLAGS], BLOBMSG_TYPE_STRING) < 0)
+			return EINVAL;
+		blobmsg_for_each_attr(cur, tb[OCI_PROCESS_SCHEDULER_FLAGS], rem) {
+			const char *flag = blobmsg_get_string(cur);
+			if (!strcmp(flag, "SCHED_FLAG_RESET_ON_FORK"))
+				opts.scheduler.flags |= SCHED_FLAG_RESET_ON_FORK;
+			else if (!strcmp(flag, "SCHED_FLAG_RECLAIM"))
+				opts.scheduler.flags |= SCHED_FLAG_RECLAIM;
+			else if (!strcmp(flag, "SCHED_FLAG_DL_OVERRUN"))
+				opts.scheduler.flags |= SCHED_FLAG_DL_OVERRUN;
+			else
+				return EINVAL;
+		}
+	}
+
+	opts.scheduler.set = true;
+	return 0;
+}
+
+static int applyOCIprocessscheduler(void)
+{
+	struct procd_sched_attr attr = {
+		.size = sizeof(attr),
+		.sched_policy = opts.scheduler.policy,
+		.sched_flags = opts.scheduler.flags,
+		.sched_nice = opts.scheduler.nice,
+		.sched_priority = opts.scheduler.priority,
+		.sched_runtime = opts.scheduler.runtime,
+		.sched_deadline = opts.scheduler.deadline,
+		.sched_period = opts.scheduler.period,
+	};
+
+	if (syscall(SYS_sched_setattr, 0, &attr, 0)) {
+		ERROR("sched_setattr: %m\n");
+		return errno;
+	}
+
+	return 0;
+}
+
 static void pre_exec_jail(struct uloop_timeout *t);
 static struct uloop_timeout pre_exec_timeout = {
 	.cb = pre_exec_jail,
@@ -1279,6 +1435,9 @@ static void post_jail_fs(void)
 static void post_start_hook(void)
 {
 	int pw_uid, pw_gid, gr_gid;
+
+	if (opts.scheduler.set && applyOCIprocessscheduler())
+		free_and_exit(EXIT_FAILURE);
 
 	/*
 	 * make sure setuid/setgid won't drop capabilities in case capabilities
@@ -1745,6 +1904,7 @@ enum {
 	OCI_PROCESS_OOMSCOREADJ,
 	OCI_PROCESS_NONEWPRIVILEGES,
 	OCI_PROCESS_RLIMITS,
+	OCI_PROCESS_SCHEDULER,
 	OCI_PROCESS_TERMINAL,
 	OCI_PROCESS_USER,
 	__OCI_PROCESS_MAX,
@@ -1759,6 +1919,7 @@ static const struct blobmsg_policy oci_process_policy[] = {
 	[OCI_PROCESS_OOMSCOREADJ] = { "oomScoreAdj", BLOBMSG_TYPE_INT32 },
 	[OCI_PROCESS_NONEWPRIVILEGES] = { "noNewPrivileges", BLOBMSG_TYPE_BOOL },
 	[OCI_PROCESS_RLIMITS] = { "rlimits", BLOBMSG_TYPE_ARRAY },
+	[OCI_PROCESS_SCHEDULER] = { "scheduler", BLOBMSG_TYPE_TABLE },
 	[OCI_PROCESS_TERMINAL] = { "terminal", BLOBMSG_TYPE_BOOL },
 	[OCI_PROCESS_USER] = { "user", BLOBMSG_TYPE_TABLE },
 };
@@ -1818,6 +1979,12 @@ static int parseOCIprocess(struct blob_attr *msg)
 
 	if (opts.console && tb[OCI_PROCESS_CONSOLESIZE]) {
 		res = parseOCIprocessconsolesize(tb[OCI_PROCESS_CONSOLESIZE]);
+		if (res)
+			return res;
+	}
+
+	if (tb[OCI_PROCESS_SCHEDULER]) {
+		res = parseOCIprocessscheduler(tb[OCI_PROCESS_SCHEDULER]);
 		if (res)
 			return res;
 	}
