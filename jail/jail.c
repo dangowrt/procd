@@ -170,6 +170,11 @@ static struct {
 		uint64_t deadline;
 		uint64_t period;
 	} scheduler;
+	struct {
+		bool set;
+		int class;
+		int priority;
+	} ioprio;
 } opts;
 
 static struct blob_buf ocibuf;
@@ -1331,6 +1336,80 @@ static int applyOCIprocessscheduler(void)
 	return 0;
 }
 
+enum {
+	OCI_PROCESS_IOPRIORITY_CLASS,
+	OCI_PROCESS_IOPRIORITY_PRIORITY,
+	__OCI_PROCESS_IOPRIORITY_MAX,
+};
+
+static const struct blobmsg_policy oci_process_iopriority_policy[] = {
+	[OCI_PROCESS_IOPRIORITY_CLASS] = { "class", BLOBMSG_TYPE_STRING },
+	[OCI_PROCESS_IOPRIORITY_PRIORITY] = { "priority", BLOBMSG_TYPE_INT32 },
+};
+
+#ifndef IOPRIO_WHO_PROCESS
+#define IOPRIO_WHO_PROCESS 1
+#endif
+
+#ifndef IOPRIO_CLASS_RT
+#define IOPRIO_CLASS_RT 1
+#endif
+
+#ifndef IOPRIO_CLASS_BE
+#define IOPRIO_CLASS_BE 2
+#endif
+
+#ifndef IOPRIO_CLASS_SHIFT
+#define IOPRIO_CLASS_SHIFT 13
+#endif
+
+#ifndef IOPRIO_CLASS_IDLE
+#define IOPRIO_CLASS_IDLE 3
+#endif
+
+static int parseOCIprocessiopriority(struct blob_attr *msg)
+{
+	struct blob_attr *tb[__OCI_PROCESS_IOPRIORITY_MAX];
+	const char *class;
+	int priority;
+
+	blobmsg_parse(oci_process_iopriority_policy, __OCI_PROCESS_IOPRIORITY_MAX, tb,
+		      blobmsg_data(msg), blobmsg_len(msg));
+
+	if (!tb[OCI_PROCESS_IOPRIORITY_CLASS] || !tb[OCI_PROCESS_IOPRIORITY_PRIORITY])
+		return ENODATA;
+
+	class = blobmsg_get_string(tb[OCI_PROCESS_IOPRIORITY_CLASS]);
+	if (!strcmp(class, "IOPRIO_CLASS_RT"))
+		opts.ioprio.class = IOPRIO_CLASS_RT;
+	else if (!strcmp(class, "IOPRIO_CLASS_BE"))
+		opts.ioprio.class = IOPRIO_CLASS_BE;
+	else if (!strcmp(class, "IOPRIO_CLASS_IDLE"))
+		opts.ioprio.class = IOPRIO_CLASS_IDLE;
+	else
+		return EINVAL;
+
+	priority = blobmsg_get_u32(tb[OCI_PROCESS_IOPRIORITY_PRIORITY]);
+	if (priority < 0 || priority > 7)
+		return EINVAL;
+
+	opts.ioprio.priority = priority;
+	opts.ioprio.set = true;
+	return 0;
+}
+
+static int applyOCIprocessiopriority(void)
+{
+	int ioprio = (opts.ioprio.class << IOPRIO_CLASS_SHIFT) | opts.ioprio.priority;
+
+	if (syscall(SYS_ioprio_set, IOPRIO_WHO_PROCESS, 0, ioprio)) {
+		ERROR("ioprio_set: %m\n");
+		return errno;
+	}
+
+	return 0;
+}
+
 static void pre_exec_jail(struct uloop_timeout *t);
 static struct uloop_timeout pre_exec_timeout = {
 	.cb = pre_exec_jail,
@@ -1437,6 +1516,9 @@ static void post_start_hook(void)
 	int pw_uid, pw_gid, gr_gid;
 
 	if (opts.scheduler.set && applyOCIprocessscheduler())
+		free_and_exit(EXIT_FAILURE);
+
+	if (opts.ioprio.set && applyOCIprocessiopriority())
 		free_and_exit(EXIT_FAILURE);
 
 	/*
@@ -1901,6 +1983,7 @@ enum {
 	OCI_PROCESS_CONSOLESIZE,
 	OCI_PROCESS_CWD,
 	OCI_PROCESS_ENV,
+	OCI_PROCESS_IOPRIORITY,
 	OCI_PROCESS_OOMSCOREADJ,
 	OCI_PROCESS_NONEWPRIVILEGES,
 	OCI_PROCESS_RLIMITS,
@@ -1916,6 +1999,7 @@ static const struct blobmsg_policy oci_process_policy[] = {
 	[OCI_PROCESS_CONSOLESIZE] = { "consoleSize", BLOBMSG_TYPE_TABLE },
 	[OCI_PROCESS_CWD] = { "cwd", BLOBMSG_TYPE_STRING },
 	[OCI_PROCESS_ENV] = { "env", BLOBMSG_TYPE_ARRAY },
+	[OCI_PROCESS_IOPRIORITY] = { "ioPriority", BLOBMSG_TYPE_TABLE },
 	[OCI_PROCESS_OOMSCOREADJ] = { "oomScoreAdj", BLOBMSG_TYPE_INT32 },
 	[OCI_PROCESS_NONEWPRIVILEGES] = { "noNewPrivileges", BLOBMSG_TYPE_BOOL },
 	[OCI_PROCESS_RLIMITS] = { "rlimits", BLOBMSG_TYPE_ARRAY },
@@ -1985,6 +2069,12 @@ static int parseOCIprocess(struct blob_attr *msg)
 
 	if (tb[OCI_PROCESS_SCHEDULER]) {
 		res = parseOCIprocessscheduler(tb[OCI_PROCESS_SCHEDULER]);
+		if (res)
+			return res;
+	}
+
+	if (tb[OCI_PROCESS_IOPRIORITY]) {
+		res = parseOCIprocessiopriority(tb[OCI_PROCESS_IOPRIORITY]);
 		if (res)
 			return res;
 	}
