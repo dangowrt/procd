@@ -41,7 +41,7 @@
 #include "log.h"
 
 #define UXC_VERSION "0.3"
-#define OCI_VERSION_STRING "1.0.2"
+#define OCI_VERSION_STRING "1.3.0"
 #define UXC_ETC_CONFDIR "/etc/uxc"
 #define UXC_VOL_CONFDIR "/tmp/run/uvol/.meta/uxc"
 
