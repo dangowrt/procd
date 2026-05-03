@@ -51,6 +51,8 @@ struct mount {
 	const char *optstr;
 	int error;
 	bool inner;
+	struct blob_attr *uidmappings;
+	struct blob_attr *gidmappings;
 };
 
 struct avl_tree mounts;
@@ -254,6 +256,8 @@ enum {
 	OCI_MOUNT_DESTINATION,
 	OCI_MOUNT_TYPE,
 	OCI_MOUNT_OPTIONS,
+	OCI_MOUNT_UIDMAPPINGS,
+	OCI_MOUNT_GIDMAPPINGS,
 	__OCI_MOUNT_MAX,
 };
 
@@ -262,6 +266,8 @@ static const struct blobmsg_policy oci_mount_policy[] = {
 	[OCI_MOUNT_DESTINATION] = { "destination", BLOBMSG_TYPE_STRING },
 	[OCI_MOUNT_TYPE] = { "type", BLOBMSG_TYPE_STRING },
 	[OCI_MOUNT_OPTIONS] = { "options", BLOBMSG_TYPE_ARRAY },
+	[OCI_MOUNT_UIDMAPPINGS] = { "uidMappings", BLOBMSG_TYPE_ARRAY },
+	[OCI_MOUNT_GIDMAPPINGS] = { "gidMappings", BLOBMSG_TYPE_ARRAY },
 };
 
 struct mount_opt {
@@ -447,6 +453,30 @@ int parseOCImount(struct blob_attr *msg)
 		  tb[OCI_MOUNT_TYPE] ? blobmsg_get_string(tb[OCI_MOUNT_TYPE]) : NULL,
 		  mount_flags, propagation_flags, mount_data, err);
 
+	if (!ret && (tb[OCI_MOUNT_UIDMAPPINGS] || tb[OCI_MOUNT_GIDMAPPINGS])) {
+		struct mount *m = avl_find_element(&mounts, destination, m, avl);
+		if (m) {
+			if (tb[OCI_MOUNT_UIDMAPPINGS]) {
+				free(m->uidmappings);
+				m->uidmappings = blob_memdup(tb[OCI_MOUNT_UIDMAPPINGS]);
+				if (!m->uidmappings) {
+					free(abs_destination);
+					free(mount_data);
+					return ENOMEM;
+				}
+			}
+			if (tb[OCI_MOUNT_GIDMAPPINGS]) {
+				free(m->gidmappings);
+				m->gidmappings = blob_memdup(tb[OCI_MOUNT_GIDMAPPINGS]);
+				if (!m->gidmappings) {
+					free(abs_destination);
+					free(mount_data);
+					return ENOMEM;
+				}
+			}
+		}
+	}
+
 	free(abs_destination);
 	if (mount_data)
 		free(mount_data);
@@ -491,6 +521,8 @@ void mount_free(void) {
 		free((void*)m->target);
 		free((void*)m->filesystemtype);
 		free((void*)m->optstr);
+		free(m->uidmappings);
+		free(m->gidmappings);
 		free(m);
 	}
 }
