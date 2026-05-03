@@ -2788,6 +2788,7 @@ enum {
 	OCI_LINUX_PERSONALITY,
 	OCI_LINUX_TIMEOFFSETS,
 	OCI_LINUX_NETDEVICES,
+	OCI_LINUX_MEMORYPOLICY,
 	__OCI_LINUX_MAX,
 };
 
@@ -2806,6 +2807,7 @@ static const struct blobmsg_policy oci_linux_policy[] = {
 	[OCI_LINUX_PERSONALITY] = { "personality", BLOBMSG_TYPE_TABLE },
 	[OCI_LINUX_TIMEOFFSETS] = { "timeOffsets", BLOBMSG_TYPE_TABLE },
 	[OCI_LINUX_NETDEVICES] = { "netDevices", BLOBMSG_TYPE_TABLE },
+	[OCI_LINUX_MEMORYPOLICY] = { "memoryPolicy", BLOBMSG_TYPE_TABLE },
 };
 
 enum {
@@ -2882,6 +2884,11 @@ static int parseOCIlinux(struct blob_attr *msg)
 
 	if (tb[OCI_LINUX_NETDEVICES])
 		opts.netdevices = blob_memdup(tb[OCI_LINUX_NETDEVICES]);
+
+	if (tb[OCI_LINUX_MEMORYPOLICY]) {
+		ERROR("linux.memoryPolicy is not supported on OpenWrt\n");
+		return ENOTSUP;
+	}
 
 	if (tb[OCI_LINUX_NAMESPACES]) {
 		blobmsg_for_each_attr(cur, tb[OCI_LINUX_NAMESPACES], rem) {
