@@ -21,6 +21,7 @@
 #include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/sysmacros.h>
+#include <sys/ioctl.h>
 
 /* musl only defined 15 limit types, make sure all 16 are supported */
 #ifndef RLIMIT_RTTIME
@@ -40,6 +41,7 @@
 #include <string.h>
 #include <fcntl.h>
 #include <sched.h>
+#include <limits.h>
 #include <linux/filter.h>
 #include <linux/limits.h>
 #include <linux/nsfs.h>
@@ -130,6 +132,8 @@ static struct {
 	int ronly;
 	int sysfs;
 	int console;
+	unsigned short console_height;
+	unsigned short console_width;
 	int pw_uid;
 	int pw_gid;
 	int gr_gid;
@@ -388,6 +392,15 @@ static int create_dev_console(const char *jail_root)
 
 	grantpt(console_fd);
 	unlockpt(console_fd);
+
+	if (opts.console_height && opts.console_width) {
+		struct winsize ws = {
+			.ws_row = opts.console_height,
+			.ws_col = opts.console_width,
+		};
+		if (ioctl(console_fd, TIOCSWINSZ, &ws))
+			WARNING("ioctl(TIOCSWINSZ) failed: %m\n");
+	}
 
 	/* pass PTY master to procd */
 	pass_console(console_fd);
@@ -1725,6 +1738,7 @@ static int parseOCIrlimit(struct blob_attr *msg)
 enum {
 	OCI_PROCESS_ARGS,
 	OCI_PROCESS_CAPABILITIES,
+	OCI_PROCESS_CONSOLESIZE,
 	OCI_PROCESS_CWD,
 	OCI_PROCESS_ENV,
 	OCI_PROCESS_OOMSCOREADJ,
@@ -1738,6 +1752,7 @@ enum {
 static const struct blobmsg_policy oci_process_policy[] = {
 	[OCI_PROCESS_ARGS] = { "args", BLOBMSG_TYPE_ARRAY },
 	[OCI_PROCESS_CAPABILITIES] = { "capabilities", BLOBMSG_TYPE_TABLE },
+	[OCI_PROCESS_CONSOLESIZE] = { "consoleSize", BLOBMSG_TYPE_TABLE },
 	[OCI_PROCESS_CWD] = { "cwd", BLOBMSG_TYPE_STRING },
 	[OCI_PROCESS_ENV] = { "env", BLOBMSG_TYPE_ARRAY },
 	[OCI_PROCESS_OOMSCOREADJ] = { "oomScoreAdj", BLOBMSG_TYPE_INT32 },
@@ -1746,6 +1761,41 @@ static const struct blobmsg_policy oci_process_policy[] = {
 	[OCI_PROCESS_TERMINAL] = { "terminal", BLOBMSG_TYPE_BOOL },
 	[OCI_PROCESS_USER] = { "user", BLOBMSG_TYPE_TABLE },
 };
+
+enum {
+	OCI_PROCESS_CONSOLESIZE_HEIGHT,
+	OCI_PROCESS_CONSOLESIZE_WIDTH,
+	__OCI_PROCESS_CONSOLESIZE_MAX,
+};
+
+static const struct blobmsg_policy oci_process_consolesize_policy[] = {
+	[OCI_PROCESS_CONSOLESIZE_HEIGHT] = { "height", BLOBMSG_TYPE_INT32 },
+	[OCI_PROCESS_CONSOLESIZE_WIDTH] = { "width", BLOBMSG_TYPE_INT32 },
+};
+
+static int parseOCIprocessconsolesize(struct blob_attr *msg)
+{
+	struct blob_attr *tb[__OCI_PROCESS_CONSOLESIZE_MAX];
+	uint32_t height, width;
+
+	blobmsg_parse(oci_process_consolesize_policy, __OCI_PROCESS_CONSOLESIZE_MAX, tb,
+		      blobmsg_data(msg), blobmsg_len(msg));
+
+	if (!tb[OCI_PROCESS_CONSOLESIZE_HEIGHT] || !tb[OCI_PROCESS_CONSOLESIZE_WIDTH])
+		return ENODATA;
+
+	height = blobmsg_get_u32(tb[OCI_PROCESS_CONSOLESIZE_HEIGHT]);
+	width = blobmsg_get_u32(tb[OCI_PROCESS_CONSOLESIZE_WIDTH]);
+	if (!height || !width || height > USHRT_MAX || width > USHRT_MAX) {
+		ERROR("consoleSize: %u x %u out of range\n", height, width);
+		return EINVAL;
+	}
+
+	opts.console_height = height;
+	opts.console_width = width;
+
+	return 0;
+}
 
 
 static int parseOCIprocess(struct blob_attr *msg)
@@ -1764,6 +1814,12 @@ static int parseOCIprocess(struct blob_attr *msg)
 
 	if (tb[OCI_PROCESS_TERMINAL])
 		opts.console = blobmsg_get_bool(tb[OCI_PROCESS_TERMINAL]);
+
+	if (opts.console && tb[OCI_PROCESS_CONSOLESIZE]) {
+		res = parseOCIprocessconsolesize(tb[OCI_PROCESS_CONSOLESIZE]);
+		if (res)
+			return res;
+	}
 
 	if (tb[OCI_PROCESS_NONEWPRIVILEGES])
 		opts.no_new_privs = blobmsg_get_bool(tb[OCI_PROCESS_NONEWPRIVILEGES]);
