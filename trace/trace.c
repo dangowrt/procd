@@ -53,11 +53,7 @@
 #elif defined(__amd64__)
 #define reg_syscall_nr	_offsetof(struct user, regs.orig_rax)
 #elif defined(__arm__)
-#include <asm/ptrace.h>		/* for PTRACE_SET_SYSCALL */
 #define reg_syscall_nr	_offsetof(struct user, regs.uregs[7])
-# if defined(__ARM_EABI__)
-# define reg_retval_nr	_offsetof(struct user, regs.uregs[0])
-# endif
 #elif defined(__i386__)
 #define reg_syscall_nr	_offsetof(struct user, regs.orig_eax)
 #elif defined(__mips)
@@ -67,7 +63,6 @@
 #define reg_syscall_nr	(EF_REG2 / 4)
 #elif defined(__PPC__)
 #define reg_syscall_nr	_offsetof(struct user, regs.gpr[0])
-#define reg_retval_nr	_offsetof(struct user, regs.gpr[3])
 #else
 #error tracing is not supported on this architecture
 #endif
@@ -267,12 +262,6 @@ static void tracer_cb(struct uloop_process *c, int ret)
 				syscall = ptsi.entry.nr;
 #else
 			int syscall = ptrace(PTRACE_PEEKUSER, c->pid, reg_syscall_nr);
-#if defined(__arm__)
-			ptrace(PTRACE_SET_SYSCALL, c->pid, 0, -1);
-			ptrace(PTRACE_POKEUSER, c->pid, reg_retval_nr, -ENOSYS);
-#else
-			ptrace(PTRACE_POKEUSER, c->pid, reg_syscall_nr, -1);
-#endif
 #endif
 			report_seccomp_vialation(c->pid, syscall);
 		} else {
