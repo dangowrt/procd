@@ -86,6 +86,8 @@ struct seccomp_data {
 # endif
 #elif defined(__PPC__)
 # define ARCH_NR	AUDIT_ARCH_PPC
+#elif defined(__riscv) && __riscv_xlen == 64
+# define ARCH_NR	AUDIT_ARCH_RISCV64
 #else
 # warning "Platform does not support seccomp filter yet"
 # define ARCH_NR	0
