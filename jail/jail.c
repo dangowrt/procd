@@ -458,6 +458,7 @@ no_console:
 
 static int hook_running = 0;
 static int hook_return_code = 0;
+static bool hook_chain_failed = false;
 static struct hook_execvpe **current_hook = NULL;
 typedef void (*hook_return_handler)(void);
 static hook_return_handler hook_return_cb = NULL;
@@ -466,8 +467,6 @@ static void hook_process_timeout_cb(struct uloop_timeout *t);
 static struct uloop_timeout hook_process_timeout = {
 	.cb = hook_process_timeout_cb,
 };
-
-static bool hook_chain_failed;
 
 static void run_hooklist(void);
 static void hook_process_handler(struct uloop_process *c, int ret)
@@ -3713,9 +3712,13 @@ static void pipe_send_start_container(struct uloop_timeout *t)
 
 static void post_poststart(void)
 {
-	uloop_run(); /* idle here while jail is running */
+	if (hook_chain_failed)
+		ERROR("poststart hook failed; stopping container\n");
+	else
+		uloop_run(); /* idle here while jail is running */
+
 	if (jail_running) {
-		DEBUG("uloop interrupted, killing jail process\n");
+		DEBUG("killing jail process\n");
 		kill(jail_process.pid, SIGTERM);
 		uloop_timeout_set(&jail_process_timeout, 1000);
 		uloop_run();
