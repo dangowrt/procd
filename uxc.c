@@ -1817,6 +1817,12 @@ next_global:
 			reload_conf();
 
 		ret = uxc_create(name, false, console_socket, systemd_cgroup);
+	} else if (!strcmp(verb, "pause") || !strcmp(verb, "resume") ||
+		   !strcmp(verb, "events") || !strcmp(verb, "checkpoint") ||
+		   !strcmp(verb, "restore") || !strcmp(verb, "exec") ||
+		   !strcmp(verb, "update")) {
+		fprintf(stderr, "uxc: '%s' is not supported\n", verb);
+		ret = -ENOTSUP;
 	} else {
 		fprintf(stderr, "uxc: unknown command '%s'\n", verb);
 		goto usage_out;
