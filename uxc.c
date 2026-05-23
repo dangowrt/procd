@@ -788,6 +788,7 @@ static int uxc_state(char *name)
 	blobmsg_add_string(&buf, "id", jail_name);
 	blobmsg_add_string(&buf, "status", rsstate?"stopped":"uninitialized");
 	blobmsg_add_string(&buf, "bundle", bundle);
+	blobmsg_close_table(&buf, blobmsg_open_table(&buf, "annotations"));
 
 	tmp = blobmsg_format_json_indent(buf.head, true, 0);
 	if (!tmp) {
