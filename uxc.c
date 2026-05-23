@@ -246,7 +246,7 @@ static int usage(void) {
 	printf("\t\t[--mounts <v1>,<v2>,...,<vN>]\t\trequire filesystems to be available\n");
 	printf("\tstart [--console] <conf>\t\tstart container <conf>\n");
 	printf("\tstate <conf>\t\t\t\tget state of container <conf>\n");
-	printf("\tkill <conf> [--signal <signal>]\t\tsend signal to container <conf>\n");
+	printf("\tkill [--signal <signal>] <conf> [<signal>]\tsend signal (default SIGTERM) to container <conf>\n");
 	printf("\tenable <conf>\t\t\t\tstart container <conf> on boot\n");
 	printf("\tdisable <conf>\t\t\t\tdon't start container <conf> on boot\n");
 	printf("\tdelete <conf> [--force]\t\t\tdelete <conf>\n");
@@ -1626,19 +1626,28 @@ int main(int argc, char **argv)
 		ret = uxc_state(verb_argv[1]);
 	} else if (!strcmp(verb, "kill")) {
 		int signal = SIGTERM;
+		bool signal_from_flag = false;
 
-		while ((c = getopt_long(verb_argc, verb_argv, "s:", kill_opts, NULL)) != -1) {
+		while ((c = getopt_long(verb_argc, verb_argv, "+s:", kill_opts, NULL)) != -1) {
 			switch (c) {
 			case 's':
 				signal = get_signum(optarg);
 				if (signal < 0)
 					goto usage_out;
+				signal_from_flag = true;
 				break;
 			default: goto usage_out;
 			}
 		}
-		if (optind != verb_argc - 1)
+		if (optind == verb_argc - 2) {
+			if (signal_from_flag)
+				goto usage_out;
+			signal = get_signum(verb_argv[optind + 1]);
+			if (signal < 0)
+				goto usage_out;
+		} else if (optind != verb_argc - 1) {
 			goto usage_out;
+		}
 		ret = uxc_kill(verb_argv[optind], signal);
 	} else if (!strcmp(verb, "enable")) {
 		if (verb_argc != 2)
