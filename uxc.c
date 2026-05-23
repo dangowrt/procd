@@ -47,7 +47,7 @@
 
 static bool verbose = false;
 static bool json_output = false;
-static char *confdir = UXC_ETC_CONFDIR;
+static const char *confdir = UXC_ETC_CONFDIR;
 static struct ustream_fd cufd;
 static struct ustream_fd lufd;
 
@@ -245,7 +245,11 @@ static struct blob_attr *fstabinfo;
 static struct ubus_context *ctx;
 
 static int usage(void) {
-	printf("syntax: uxc <command> [parameters ...]\n");
+	printf("syntax: uxc [global options] <command> [parameters ...]\n");
+	printf("global options:\n");
+	printf("\t[--debug|-v] [--log <path>] [--log-format <text|json>]\n");
+	printf("\t[--root <dir>] [--rootless[=auto|true|false]]\n");
+	printf("\t[--systemd-cgroup] [--criu <path>]\n");
 	printf("commands:\n");
 	printf("\tlist [--json]\t\t\t\tlist all configured containers (runc-compatible)\n");
 	printf("\tattach <conf>\t\t\t\tattach to container console\n");
@@ -300,7 +304,7 @@ static int conf_load(bool load_settings)
 	struct stat sb;
 	struct blob_buf *target;
 
-	if (asprintf(&globstr, "%s/%s*.json", UXC_ETC_CONFDIR, load_settings?"settings/":"") == -1)
+	if (asprintf(&globstr, "%s/%s*.json", confdir, load_settings?"settings/":"") == -1)
 		return -ENOMEM;
 
 	res = glob(globstr, gl_flags, NULL, &gl);
@@ -1556,6 +1560,9 @@ int main(int argc, char **argv)
 {
 	int ret = -EINVAL;
 	const char *verb;
+	const char *log_path = NULL;
+	const char *log_format = NULL;
+	const char *criu_path = NULL;
 	int verb_argc, c, i;
 	char **verb_argv;
 
@@ -1565,6 +1572,7 @@ int main(int argc, char **argv)
 	 */
 	for (i = 1; i < argc; ++i) {
 		const char *a = argv[i];
+		const char *eq;
 
 		if (a[0] != '-')
 			break;
@@ -1579,17 +1587,75 @@ int main(int argc, char **argv)
 			return 0;
 		}
 
-		if (!strcmp(a, "-v") || !strcmp(a, "--verbose")) {
+		if (!strcmp(a, "-v") || !strcmp(a, "--verbose") || !strcmp(a, "--debug")) {
 			verbose = true;
 			continue;
 		}
 
+		if (!strcmp(a, "--systemd-cgroup")) {
+			continue;
+		}
+
+		eq = strchr(a, '=');
+
+#define GLOBAL_OPT_VAL(name, dst) \
+		do { \
+			size_t _n = strlen(name); \
+			if (eq && !strncmp(a, name, _n) && a[_n] == '=') { \
+				dst = eq + 1; \
+				goto next_global; \
+			} \
+			if (!strcmp(a, name)) { \
+				if (i + 1 >= argc) { \
+					fprintf(stderr, "uxc: %s requires an argument\n", a); \
+					return -EINVAL; \
+				} \
+				dst = argv[++i]; \
+				goto next_global; \
+			} \
+		} while (0)
+
+		GLOBAL_OPT_VAL("--root",       confdir);
+		GLOBAL_OPT_VAL("--log",        log_path);
+		GLOBAL_OPT_VAL("--log-format", log_format);
+		GLOBAL_OPT_VAL("--criu",       criu_path);
+#undef GLOBAL_OPT_VAL
+
+		if (eq && !strncmp(a, "--rootless=", 11))
+			continue;
+		if (!strcmp(a, "--rootless"))
+			continue;
+
 		fprintf(stderr, "uxc: unknown option '%s'\n", a);
 		return usage();
+next_global:
+		continue;
 	}
 
 	if (i >= argc)
 		return usage();
+
+	if (log_path) {
+		int fd = open(log_path, O_WRONLY | O_CREAT | O_APPEND, 0644);
+		if (fd < 0) {
+			fprintf(stderr, "uxc: cannot open --log path %s: %m\n", log_path);
+			return -EIO;
+		}
+		if (dup2(fd, STDERR_FILENO) < 0) {
+			dprintf(fd, "uxc: dup2(--log path) failed: %m\n");
+			close(fd);
+			return -EIO;
+		}
+		close(fd);
+	}
+
+	if (log_format && strcmp(log_format, "text"))
+		fprintf(stderr, "uxc: --log-format=%s accepted but only text output is emitted\n",
+			log_format);
+
+	if (criu_path)
+		fprintf(stderr, "uxc: --criu=%s accepted but ignored (no checkpoint/restore support)\n",
+			criu_path);
 
 	verb = argv[i];
 	verb_argc = argc - i;
