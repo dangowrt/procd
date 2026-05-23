@@ -73,14 +73,25 @@ struct settings {
 	struct blob_attr *volumes;
 };
 
+enum {
+	OPT_CONSOLE_SOCKET	= 0x100,
+	OPT_NO_PIVOT,
+	OPT_NO_NEW_KEYRING,
+	OPT_PRESERVE_FDS,
+};
+
 static const struct option create_opts[] = {
-	{"autostart",		no_argument,		0,	'a'	},
-	{"bundle",		required_argument,	0,	'b'	},
-	{"mounts",		required_argument,	0,	'm'	},
-	{"pid-file",		required_argument,	0,	'p'	},
-	{"temp-overlay-size",	required_argument,	0,	't'	},
-	{"write-overlay-path",	required_argument,	0,	'w'	},
-	{0,			0,			0,	0	}
+	{"autostart",		no_argument,		0,	'a'			},
+	{"bundle",		required_argument,	0,	'b'			},
+	{"console-socket",	required_argument,	0,	OPT_CONSOLE_SOCKET	},
+	{"mounts",		required_argument,	0,	'm'			},
+	{"no-new-keyring",	no_argument,		0,	OPT_NO_NEW_KEYRING	},
+	{"no-pivot",		no_argument,		0,	OPT_NO_PIVOT		},
+	{"pid-file",		required_argument,	0,	'p'			},
+	{"preserve-fds",	required_argument,	0,	OPT_PRESERVE_FDS	},
+	{"temp-overlay-size",	required_argument,	0,	't'			},
+	{"write-overlay-path",	required_argument,	0,	'w'			},
+	{0,			0,			0,	0			}
 };
 
 static const struct option start_opts[] = {
@@ -240,6 +251,9 @@ static int usage(void) {
 	printf("\tattach <conf>\t\t\t\tattach to container console\n");
 	printf("\tcreate <conf>\t\t\t\t(re-)create <conf>\n");
 	printf("\t\t[--bundle <path>]\t\t\tOCI bundle at <path>\n");
+	printf("\t\t[--pid-file <path>]\t\t\twrite container PID to <path>\n");
+	printf("\t\t[--console-socket <path>]\t\tAF_UNIX socket to receive the PTY master fd\n");
+	printf("\t\t[--no-pivot|--no-new-keyring|--preserve-fds <N>] runc-compat, currently ignored\n");
 	printf("\t\t[--autostart]\t\t\t\tstart on boot\n");
 	printf("\t\t[--temp-overlay-size <size>]\t\tuse tmpfs overlay with {size}\n");
 	printf("\t\t[--write-overlay-path <path>]\t\tuse overlay on {path}\n");
@@ -1684,6 +1698,7 @@ int main(int argc, char **argv)
 	} else if (!strcmp(verb, "create")) {
 		char *bundle = NULL, *pidfile = NULL;
 		char *tmprwsize = NULL, *writepath = NULL, *requiredmounts = NULL;
+		char *console_socket = NULL;
 		signed char autostart = -1;
 		char *name;
 
@@ -1696,9 +1711,23 @@ int main(int argc, char **argv)
 			case 'p': pidfile = optarg; break;
 			case 't': tmprwsize = optarg; break;
 			case 'w': writepath = optarg; break;
+			case OPT_CONSOLE_SOCKET:
+				console_socket = optarg;
+				fprintf(stderr, "uxc: --console-socket accepted but not yet plumbed to the jail\n");
+				break;
+			case OPT_NO_PIVOT:
+				fprintf(stderr, "uxc: --no-pivot accepted but ignored (ujail does not pivot_root in this mode)\n");
+				break;
+			case OPT_NO_NEW_KEYRING:
+				fprintf(stderr, "uxc: --no-new-keyring accepted but ignored (ujail does not create kernel keyrings)\n");
+				break;
+			case OPT_PRESERVE_FDS:
+				fprintf(stderr, "uxc: --preserve-fds=%s accepted but ignored\n", optarg);
+				break;
 			default: goto usage_out;
 			}
 		}
+		(void)console_socket;
 		if (optind != verb_argc - 1)
 			goto usage_out;
 		name = verb_argv[optind];
