@@ -236,7 +236,7 @@ static struct ubus_context *ctx;
 static int usage(void) {
 	printf("syntax: uxc <command> [parameters ...]\n");
 	printf("commands:\n");
-	printf("\tlist [--json]\t\t\t\tlist all configured containers\n");
+	printf("\tlist [--json]\t\t\t\tlist all configured containers (runc-compatible)\n");
 	printf("\tattach <conf>\t\t\t\tattach to container console\n");
 	printf("\tcreate <conf>\t\t\t\t(re-)create <conf>\n");
 	printf("\t\t[--bundle <path>]\t\t\tOCI bundle at <path>\n");
@@ -807,79 +807,90 @@ static int uxc_state(char *name)
 static int uxc_list(void)
 {
 	struct blob_attr *cur, *tb[__CONF_MAX], *ts[__STATE_MAX];
-	int rem;
+	int rem, pass;
 	struct runtime_state *rsstate = NULL;
-	struct settings *usettings = NULL;
-	char *name, *ocistatus, *status, *tmp;
-	int container_pid = -1;
-	bool autostart;
+	char *name, *bundle, *ocistatus, *status, *created, *tmp;
+	int container_pid;
 	static struct blob_buf buf;
-	void *arr, *obj;
+	void *arr, *obj, *ann;
+	size_t id_w = 2, pid_w = 3, status_w = 6, bundle_w = 6, created_w = 7;
+	char pidstr[12];
 
 	if (json_output) {
 		blob_buf_init(&buf, 0);
 		arr = blobmsg_open_array(&buf, "");
 	}
 
-	blobmsg_for_each_attr(cur, blob_data(conf.head), rem) {
-		blobmsg_parse(conf_policy, __CONF_MAX, tb, blobmsg_data(cur), blobmsg_len(cur));
-		if (!tb[CONF_NAME] || !tb[CONF_PATH])
-			continue;
+	for (pass = json_output ? 1 : 0; pass < 2; pass++) {
+		if (pass == 1 && !json_output)
+			printf("%-*s %-*s %-*s %-*s %-*s %s\n",
+			       (int)id_w, "ID", (int)pid_w, "PID",
+			       (int)status_w, "STATUS", (int)bundle_w, "BUNDLE",
+			       (int)created_w, "CREATED", "OWNER");
 
-		autostart = tb[CONF_AUTOSTART] && blobmsg_get_bool(tb[CONF_AUTOSTART]);
+		blobmsg_for_each_attr(cur, blob_data(conf.head), rem) {
+			blobmsg_parse(conf_policy, __CONF_MAX, tb,
+				      blobmsg_data(cur), blobmsg_len(cur));
+			if (!tb[CONF_NAME] || !tb[CONF_PATH])
+				continue;
 
-		ocistatus = NULL;
-		container_pid = 0;
-		name = blobmsg_get_string(tb[CONF_NAME]);
-		rsstate = avl_find_element(&runtime, name, rsstate, avl);
+			name = blobmsg_get_string(tb[CONF_NAME]);
+			bundle = blobmsg_get_string(tb[CONF_PATH]);
 
-		if (rsstate && rsstate->ocistate) {
-			blobmsg_parse(state_policy, __STATE_MAX, ts, blobmsg_data(rsstate->ocistate), blobmsg_len(rsstate->ocistate));
-			ocistatus = blobmsg_get_string(ts[STATE_STATUS]);
-			container_pid = blobmsg_get_u32(ts[STATE_PID]);
-		}
+			ocistatus = NULL;
+			container_pid = 0;
+			created = "-";
+			rsstate = avl_find_element(&runtime, name, rsstate, avl);
+			if (rsstate && rsstate->ocistate) {
+				blobmsg_parse(state_policy, __STATE_MAX, ts,
+					      blobmsg_data(rsstate->ocistate),
+					      blobmsg_len(rsstate->ocistate));
+				if (ts[STATE_STATUS])
+					ocistatus = blobmsg_get_string(ts[STATE_STATUS]);
+				if (ts[STATE_PID])
+					container_pid = blobmsg_get_u32(ts[STATE_PID]);
+				if (ts[STATE_BUNDLE])
+					bundle = blobmsg_get_string(ts[STATE_BUNDLE]);
+			}
+			status = ocistatus?:(rsstate && rsstate->running)?"creating":(rsstate?"stopped":"uninitialized");
 
-		status = ocistatus?:(rsstate && rsstate->running)?"creating":"stopped";
-
-		usettings = avl_find_element(&settings, name, usettings, avl);
-
-		if (usettings && (usettings->autostart >= 0))
-			autostart = !!(usettings->autostart);
-
-		if (json_output) {
-			obj = blobmsg_open_table(&buf, "");
-			blobmsg_add_string(&buf, "name", name);
-			blobmsg_add_string(&buf, "status", status);
-			blobmsg_add_u8(&buf, "autostart", autostart);
-		} else {
-			printf("[%c] %s %s", autostart?'*':' ', name, status);
-		}
-
-		if (rsstate && !rsstate->running && (rsstate->exitcode >= 0)) {
-			if (json_output)
-				blobmsg_add_u32(&buf, "exitcode", rsstate->exitcode);
+			if (container_pid > 0)
+				snprintf(pidstr, sizeof(pidstr), "%d", container_pid);
 			else
-				printf(" exitcode: %d (%s)", rsstate->exitcode, strerror(rsstate->exitcode));
-		}
+				snprintf(pidstr, sizeof(pidstr), "%s", "-");
 
-		if (rsstate && rsstate->running && (rsstate->runtime_pid >= 0)) {
-			if (json_output)
-				blobmsg_add_u32(&buf, "runtime_pid", rsstate->runtime_pid);
-			else
-				printf(" runtime pid: %d", rsstate->runtime_pid);
-		}
+			if (pass == 0) {
+				if (strlen(name) > id_w) id_w = strlen(name);
+				if (strlen(pidstr) > pid_w) pid_w = strlen(pidstr);
+				if (strlen(status) > status_w) status_w = strlen(status);
+				if (strlen(bundle) > bundle_w) bundle_w = strlen(bundle);
+				if (strlen(created) > created_w) created_w = strlen(created);
+				continue;
+			}
 
-		if (rsstate && rsstate->running && (container_pid >= 0)) {
-			if (json_output)
-				blobmsg_add_u32(&buf, "container_pid", container_pid);
-			else
-				printf(" container pid: %d", container_pid);
+			if (json_output) {
+				obj = blobmsg_open_table(&buf, "");
+				blobmsg_add_string(&buf, "ociVersion", OCI_VERSION_STRING);
+				blobmsg_add_string(&buf, "id", name);
+				if (container_pid > 0)
+					blobmsg_add_u32(&buf, "pid", container_pid);
+				blobmsg_add_string(&buf, "status", status);
+				blobmsg_add_string(&buf, "bundle", bundle);
+				if (rsstate && rsstate->ocistate && ts[STATE_ANNOTATIONS]) {
+					blobmsg_add_blob(&buf, ts[STATE_ANNOTATIONS]);
+				} else {
+					ann = blobmsg_open_table(&buf, "annotations");
+					blobmsg_close_table(&buf, ann);
+				}
+				blobmsg_add_string(&buf, "owner", "root");
+				blobmsg_close_table(&buf, obj);
+			} else {
+				printf("%-*s %-*s %-*s %-*s %-*s %s\n",
+				       (int)id_w, name, (int)pid_w, pidstr,
+				       (int)status_w, status, (int)bundle_w, bundle,
+				       (int)created_w, created, "root");
+			}
 		}
-
-		if (!json_output)
-			printf("\n");
-		else
-			blobmsg_close_table(&buf, obj);
 	}
 
 	if (json_output) {
@@ -892,7 +903,7 @@ static int uxc_list(void)
 		printf("%s\n", tmp);
 		free(tmp);
 		blob_buf_free(&buf);
-	};
+	}
 
 	return 0;
 }
