@@ -124,6 +124,7 @@ enum {
 	JAIL_ATTR_IMMEDIATELY,
 	JAIL_ATTR_PIDFILE,
 	JAIL_ATTR_SETNS,
+	JAIL_ATTR_CONSOLESOCKET,
 	__JAIL_ATTR_MAX,
 };
 
@@ -145,6 +146,7 @@ static const struct blobmsg_policy jail_attr[__JAIL_ATTR_MAX] = {
 	[JAIL_ATTR_IMMEDIATELY] = { "immediately", BLOBMSG_TYPE_BOOL },
 	[JAIL_ATTR_PIDFILE] = { "pidfile", BLOBMSG_TYPE_STRING },
 	[JAIL_ATTR_SETNS] = { "setns", BLOBMSG_TYPE_ARRAY },
+	[JAIL_ATTR_CONSOLESOCKET] = { "consolesocket", BLOBMSG_TYPE_STRING },
 };
 
 enum {
@@ -389,6 +391,11 @@ jail_run(struct service_instance *in, char **argv)
 	if (jail->pidfile) {
 		argv[argc++] = "-P";
 		argv[argc++] = jail->pidfile;
+	}
+
+	if (jail->consolesocket) {
+		argv[argc++] = "-Y";
+		argv[argc++] = jail->consolesocket;
 	}
 
 	if (in->bundle) {
@@ -1050,6 +1057,9 @@ instance_config_changed(struct service_instance *in, struct service_instance *in
 	if (string_changed(in->jail.pidfile, in_new->jail.pidfile))
 		return true;
 
+	if (string_changed(in->jail.consolesocket, in_new->jail.consolesocket))
+		return true;
+
 	if (in->jail.flags != in_new->jail.flags)
 		return true;
 
@@ -1219,6 +1229,11 @@ instance_jail_parse(struct service_instance *in, struct blob_attr *attr)
 	}
 	if (tb[JAIL_ATTR_PIDFILE]) {
 		jail->pidfile = strdup(blobmsg_get_string(tb[JAIL_ATTR_PIDFILE]));
+		jail->argc += 2;
+	}
+
+	if (tb[JAIL_ATTR_CONSOLESOCKET]) {
+		jail->consolesocket = strdup(blobmsg_get_string(tb[JAIL_ATTR_CONSOLESOCKET]));
 		jail->argc += 2;
 	}
 
@@ -1563,6 +1578,7 @@ instance_config_move(struct service_instance *in, struct service_instance *in_sr
 	instance_config_move_strdup(&in->jail.name, in_src->jail.name);
 	instance_config_move_strdup(&in->jail.hostname, in_src->jail.hostname);
 	instance_config_move_strdup(&in->jail.pidfile, in_src->jail.pidfile);
+	instance_config_move_strdup(&in->jail.consolesocket, in_src->jail.consolesocket);
 
 	free(in->config);
 	in->config = in_src->config;
@@ -1613,6 +1629,7 @@ instance_free(struct service_instance *in)
 	free(in->jail.name);
 	free(in->jail.hostname);
 	free(in->jail.pidfile);
+	free(in->jail.consolesocket);
 	free(in->seccomp);
 	free(in->capabilities);
 	free(in->pidfile);

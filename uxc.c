@@ -933,7 +933,7 @@ static int uxc_exists(char *name)
 	return 0;
 }
 
-static int uxc_create(char *name, bool immediately)
+static int uxc_create(char *name, bool immediately, const char *console_socket)
 {
 	static struct blob_buf req;
 	struct blob_attr *cur, *tb[__CONF_MAX];
@@ -997,6 +997,9 @@ static int uxc_create(char *name, bool immediately)
 
 	if (pidfile)
 		blobmsg_add_string(&req, "pidfile", pidfile);
+
+	if (console_socket)
+		blobmsg_add_string(&req, "consolesocket", console_socket);
 
 	blobmsg_close_table(&req, j);
 
@@ -1423,7 +1426,7 @@ static int uxc_boot(void)
 		if (uxc_exists(name))
 			continue;
 
-		if (uxc_create(name, true))
+		if (uxc_create(name, true, NULL))
 			++ret;
 
 		free(name);
@@ -1713,7 +1716,6 @@ int main(int argc, char **argv)
 			case 'w': writepath = optarg; break;
 			case OPT_CONSOLE_SOCKET:
 				console_socket = optarg;
-				fprintf(stderr, "uxc: --console-socket accepted but not yet plumbed to the jail\n");
 				break;
 			case OPT_NO_PIVOT:
 				fprintf(stderr, "uxc: --no-pivot accepted but ignored (ujail does not pivot_root in this mode)\n");
@@ -1727,7 +1729,6 @@ int main(int argc, char **argv)
 			default: goto usage_out;
 			}
 		}
-		(void)console_socket;
 		if (optind != verb_argc - 1)
 			goto usage_out;
 		name = verb_argv[optind];
@@ -1743,7 +1744,7 @@ int main(int argc, char **argv)
 		if (ret > 0)
 			reload_conf();
 
-		ret = uxc_create(name, false);
+		ret = uxc_create(name, false, console_socket);
 	} else {
 		fprintf(stderr, "uxc: unknown command '%s'\n", verb);
 		goto usage_out;

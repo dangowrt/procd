@@ -25,6 +25,7 @@
 #include <sys/personality.h>
 #include <sys/syscall.h>
 #include <sys/socket.h>
+#include <sys/un.h>
 #include <linux/rtnetlink.h>
 #include <net/if.h>
 
@@ -53,6 +54,7 @@
 #include <linux/securebits.h>
 #include <signal.h>
 #include <inttypes.h>
+#include <limits.h>
 
 #include "capabilities.h"
 #include "elf.h"
@@ -76,7 +78,7 @@
 #endif
 
 #define STACK_SIZE	(1024 * 1024)
-#define OPT_ARGS	"cC:d:De:EfFG:h:ij:J:ln:NoO:pP:r:R:sS:uU:w:t:T:y"
+#define OPT_ARGS	"cC:d:De:EfFG:h:ij:J:ln:NoO:pP:r:R:sS:uU:w:t:T:yY:"
 
 struct hook_execvpe {
 	char *file;
@@ -136,6 +138,7 @@ static struct {
 	int ronly;
 	int sysfs;
 	int console;
+	char *console_socket;
 	unsigned short console_height;
 	unsigned short console_width;
 	int pw_uid;
@@ -398,6 +401,82 @@ static void pass_console(int console_fd)
 	ubus_free(child_ctx);
 }
 
+static int parse_inherited_console_fd(const char *spec)
+{
+	char *endptr;
+	long fd;
+
+	if (!spec || !*spec)
+		return -1;
+
+	errno = 0;
+	fd = strtol(spec, &endptr, 10);
+	if (errno || *endptr || endptr == spec || fd < 0 || fd > INT_MAX)
+		return -1;
+
+	if (fcntl((int)fd, F_GETFD) == -1)
+		return -1;
+
+	return (int)fd;
+}
+
+static int send_console_fd(const char *spec, int console_fd, const char *slave_name)
+{
+	struct msghdr msg = { 0 };
+	struct cmsghdr *cmsg;
+	struct iovec iov;
+	char cbuf[CMSG_SPACE(sizeof(int))] = { 0 };
+	int sock;
+	bool own_sock = false;
+	int ret = -1;
+
+	sock = parse_inherited_console_fd(spec);
+	if (sock < 0) {
+		struct sockaddr_un addr = { .sun_family = AF_UNIX };
+
+		if (strlen(spec) >= sizeof(addr.sun_path)) {
+			ERROR("console-socket path too long: %s\n", spec);
+			return -1;
+		}
+		strncpy(addr.sun_path, spec, sizeof(addr.sun_path) - 1);
+
+		sock = socket(AF_UNIX, SOCK_STREAM, 0);
+		if (sock < 0) {
+			ERROR("console-socket: socket(): %m\n");
+			return -1;
+		}
+		if (connect(sock, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+			ERROR("console-socket: connect(%s): %m\n", spec);
+			close(sock);
+			return -1;
+		}
+		own_sock = true;
+	}
+
+	iov.iov_base = (void *)slave_name;
+	iov.iov_len = strlen(slave_name);
+	msg.msg_iov = &iov;
+	msg.msg_iovlen = 1;
+	msg.msg_control = cbuf;
+	msg.msg_controllen = sizeof(cbuf);
+
+	cmsg = CMSG_FIRSTHDR(&msg);
+	cmsg->cmsg_level = SOL_SOCKET;
+	cmsg->cmsg_type = SCM_RIGHTS;
+	cmsg->cmsg_len = CMSG_LEN(sizeof(int));
+	memcpy(CMSG_DATA(cmsg), &console_fd, sizeof(int));
+
+	if (sendmsg(sock, &msg, 0) < 0) {
+		ERROR("console-socket: sendmsg(%s): %m\n", spec);
+		goto out;
+	}
+	ret = 0;
+out:
+	if (own_sock)
+		close(sock);
+	return ret;
+}
+
 static int create_dev_console(const char *jail_root)
 {
 	char *console_fname;
@@ -426,8 +505,14 @@ static int create_dev_console(const char *jail_root)
 			WARNING("ioctl(TIOCSWINSZ) failed: %m\n");
 	}
 
-	/* pass PTY master to procd */
-	pass_console(console_fd);
+	if (opts.console_socket) {
+		if (send_console_fd(opts.console_socket, console_fd, console_fname))
+			goto no_console;
+		close(console_fd);
+	} else {
+		/* pass PTY master to procd */
+		pass_console(console_fd);
+	}
 
 	/* mount-bind PTY slave to /dev/console in jail */
 	snprintf(dev_console_path, sizeof(dev_console_path), "%s/dev/console", jail_root);
@@ -1079,6 +1164,7 @@ static void usage(void)
 	fprintf(stderr, "  -T <size>\tuse tmpfs r/w overlayfs with <size>\n");
 	fprintf(stderr, "  -E\t\tfail if jail cannot be setup\n");
 	fprintf(stderr, "  -y\t\tprovide jail console\n");
+	fprintf(stderr, "  -Y <spec>\tsend PTY master fd via inherited fd or AF_UNIX path\n");
 	fprintf(stderr, "  -J <dir>\tcreate container from OCI bundle\n");
 	fprintf(stderr, "  -i\t\tstart container immediately\n");
 	fprintf(stderr, "  -P <pidfile>\tcreate <pidfile>\n");
@@ -3445,6 +3531,9 @@ int main(int argc, char **argv)
 			break;
 		case 'P':
 			opts.pidfile = optarg;
+			break;
+		case 'Y':
+			opts.console_socket = optarg;
 			break;
 		}
 	}
