@@ -3110,7 +3110,7 @@ static int parseOCIlinux(struct blob_attr *msg)
 	cgroups_init(cgfullpath);
 
 	if (tb[OCI_LINUX_RESOURCES]) {
-		res = parseOCIlinuxcgroups(tb[OCI_LINUX_RESOURCES]);
+		res = parseOCIlinuxcgroups(tb[OCI_LINUX_RESOURCES], false);
 		if (res)
 			return res;
 	}
@@ -3355,15 +3355,18 @@ container_handle_update(struct ubus_context *ctx, struct ubus_object *obj,
 	if (!msg)
 		return UBUS_STATUS_INVALID_ARGUMENT;
 
-	rc = parseOCIlinuxcgroups(msg);
+	rc = parseOCIlinuxcgroups(msg, true);
 	if (rc) {
 		switch (rc) {
 		case ENOTSUP:
 			return UBUS_STATUS_NOT_SUPPORTED;
+		case EBUSY:
 		case EINVAL:
 		case ENODATA:
 		case ERANGE:
 			return UBUS_STATUS_INVALID_ARGUMENT;
+		case EIO:
+			return UBUS_STATUS_UNKNOWN_ERROR;
 		default:
 			return UBUS_STATUS_UNKNOWN_ERROR;
 		}

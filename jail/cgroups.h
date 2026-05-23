@@ -14,8 +14,10 @@
 #ifndef _JAIL_CGROUPS_H
 #define _JAIL_CGROUPS_H
 
+#include <stdbool.h>
+
 void cgroups_init(const char *p);
-int parseOCIlinuxcgroups(struct blob_attr *msg);
+int parseOCIlinuxcgroups(struct blob_attr *msg, bool is_update);
 void cgroups_apply(pid_t pid);
 int cgroups_attach_pid(pid_t pid);
 void cgroups_free(void);
