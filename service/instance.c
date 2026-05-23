@@ -125,6 +125,7 @@ enum {
 	JAIL_ATTR_PIDFILE,
 	JAIL_ATTR_SETNS,
 	JAIL_ATTR_CONSOLESOCKET,
+	JAIL_ATTR_SYSTEMDCGROUP,
 	__JAIL_ATTR_MAX,
 };
 
@@ -147,6 +148,7 @@ static const struct blobmsg_policy jail_attr[__JAIL_ATTR_MAX] = {
 	[JAIL_ATTR_PIDFILE] = { "pidfile", BLOBMSG_TYPE_STRING },
 	[JAIL_ATTR_SETNS] = { "setns", BLOBMSG_TYPE_ARRAY },
 	[JAIL_ATTR_CONSOLESOCKET] = { "consolesocket", BLOBMSG_TYPE_STRING },
+	[JAIL_ATTR_SYSTEMDCGROUP] = { "systemdcgroup", BLOBMSG_TYPE_BOOL },
 };
 
 enum {
@@ -397,6 +399,9 @@ jail_run(struct service_instance *in, char **argv)
 		argv[argc++] = "-Y";
 		argv[argc++] = jail->consolesocket;
 	}
+
+	if (jail->systemd_cgroup)
+		argv[argc++] = "-Z";
 
 	if (in->bundle) {
 		argv[argc++] = "-J";
@@ -1235,6 +1240,11 @@ instance_jail_parse(struct service_instance *in, struct blob_attr *attr)
 	if (tb[JAIL_ATTR_CONSOLESOCKET]) {
 		jail->consolesocket = strdup(blobmsg_get_string(tb[JAIL_ATTR_CONSOLESOCKET]));
 		jail->argc += 2;
+	}
+
+	if (tb[JAIL_ATTR_SYSTEMDCGROUP] && blobmsg_get_bool(tb[JAIL_ATTR_SYSTEMDCGROUP])) {
+		jail->systemd_cgroup = true;
+		jail->argc++;
 	}
 
 	if (tb[JAIL_ATTR_SETNS]) {

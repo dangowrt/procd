@@ -937,7 +937,8 @@ static int uxc_exists(char *name)
 	return 0;
 }
 
-static int uxc_create(char *name, bool immediately, const char *console_socket)
+static int uxc_create(char *name, bool immediately, const char *console_socket,
+		      bool systemd_cgroup)
 {
 	static struct blob_buf req;
 	struct blob_attr *cur, *tb[__CONF_MAX];
@@ -1004,6 +1005,9 @@ static int uxc_create(char *name, bool immediately, const char *console_socket)
 
 	if (console_socket)
 		blobmsg_add_string(&req, "consolesocket", console_socket);
+
+	if (systemd_cgroup)
+		blobmsg_add_u8(&req, "systemdcgroup", 1);
 
 	blobmsg_close_table(&req, j);
 
@@ -1430,7 +1434,7 @@ static int uxc_boot(void)
 		if (uxc_exists(name))
 			continue;
 
-		if (uxc_create(name, true, NULL))
+		if (uxc_create(name, true, NULL, false))
 			++ret;
 
 		free(name);
@@ -1563,6 +1567,7 @@ int main(int argc, char **argv)
 	const char *log_path = NULL;
 	const char *log_format = NULL;
 	const char *criu_path = NULL;
+	bool systemd_cgroup = false;
 	int verb_argc, c, i;
 	char **verb_argv;
 
@@ -1593,6 +1598,7 @@ int main(int argc, char **argv)
 		}
 
 		if (!strcmp(a, "--systemd-cgroup")) {
+			systemd_cgroup = true;
 			continue;
 		}
 
@@ -1810,7 +1816,7 @@ next_global:
 		if (ret > 0)
 			reload_conf();
 
-		ret = uxc_create(name, false, console_socket);
+		ret = uxc_create(name, false, console_socket, systemd_cgroup);
 	} else {
 		fprintf(stderr, "uxc: unknown command '%s'\n", verb);
 		goto usage_out;

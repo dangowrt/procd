@@ -78,7 +78,7 @@
 #endif
 
 #define STACK_SIZE	(1024 * 1024)
-#define OPT_ARGS	"cC:d:De:EfFG:h:ij:J:ln:NoO:pP:r:R:sS:uU:w:t:T:yY:"
+#define OPT_ARGS	"cC:d:De:EfFG:h:ij:J:ln:NoO:pP:r:R:sS:uU:w:t:T:yY:Z"
 
 struct hook_execvpe {
 	char *file;
@@ -139,6 +139,7 @@ static struct {
 	int sysfs;
 	int console;
 	char *console_socket;
+	bool systemd_cgroup;
 	unsigned short console_height;
 	unsigned short console_width;
 	int pw_uid;
@@ -3053,7 +3054,36 @@ static int parseOCIlinux(struct blob_attr *msg)
 
 	if (tb[OCI_LINUX_CGROUPSPATH]) {
 		cgpath = blobmsg_get_string(tb[OCI_LINUX_CGROUPSPATH]);
-		if (cgpath[0] == '/') {
+		if (opts.systemd_cgroup) {
+			char *orig = strdupa(cgpath);
+			char *slice = cgpath;
+			char *prefix = strchr(slice, ':');
+			char *id;
+
+			if (!prefix || prefix == slice) {
+				ERROR("--systemd-cgroup: cgroupsPath %s is not slice:prefix:name\n", orig);
+				return EINVAL;
+			}
+			*prefix++ = '\0';
+			id = strchr(prefix, ':');
+			if (!id || id == prefix || !id[1]) {
+				ERROR("--systemd-cgroup: cgroupsPath %s is not slice:prefix:name\n", orig);
+				return EINVAL;
+			}
+			*id++ = '\0';
+
+			if (strlen(slice) + strlen(prefix) + strlen(id) + 9
+			    >= (sizeof(cgfullpath) - strlen(cgfullpath)))
+				return E2BIG;
+
+			strcat(cgfullpath, "/");
+			strcat(cgfullpath, slice);
+			strcat(cgfullpath, "/");
+			strcat(cgfullpath, prefix);
+			strcat(cgfullpath, "-");
+			strcat(cgfullpath, id);
+			strcat(cgfullpath, ".scope");
+		} else if (cgpath[0] == '/') {
 			if (strlen(cgpath) + 1 >= (sizeof(cgfullpath) - strlen(cgfullpath)))
 				return E2BIG;
 
@@ -3534,6 +3564,9 @@ int main(int argc, char **argv)
 			break;
 		case 'Y':
 			opts.console_socket = optarg;
+			break;
+		case 'Z':
+			opts.systemd_cgroup = true;
 			break;
 		}
 	}
