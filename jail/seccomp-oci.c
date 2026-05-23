@@ -367,11 +367,19 @@ struct sock_fprog *parseOCIlinuxseccomp(struct blob_attr *msg)
 					      tba, blobmsg_data(curarg), blobmsg_len(curarg));
 				if (!tba[OCI_LINUX_SECCOMP_SYSCALLS_ARGS_INDEX] ||
 				    !tba[OCI_LINUX_SECCOMP_SYSCALLS_ARGS_VALUE] ||
-				    !tba[OCI_LINUX_SECCOMP_SYSCALLS_ARGS_OP])
+				    !tba[OCI_LINUX_SECCOMP_SYSCALLS_ARGS_OP]) {
+					ERROR("seccomp: syscall arg missing%s%s%s\n",
+					      tba[OCI_LINUX_SECCOMP_SYSCALLS_ARGS_INDEX] ? "" : " index",
+					      tba[OCI_LINUX_SECCOMP_SYSCALLS_ARGS_VALUE] ? "" : " value",
+					      tba[OCI_LINUX_SECCOMP_SYSCALLS_ARGS_OP] ? "" : " op");
 					return NULL;
+				}
 
-				if (blobmsg_get_u32(tba[OCI_LINUX_SECCOMP_SYSCALLS_ARGS_INDEX]) > 5)
+				if (blobmsg_get_u32(tba[OCI_LINUX_SECCOMP_SYSCALLS_ARGS_INDEX]) > 5) {
+					ERROR("seccomp: syscall arg index %u out of range (max 5)\n",
+					      blobmsg_get_u32(tba[OCI_LINUX_SECCOMP_SYSCALLS_ARGS_INDEX]));
 					return NULL;
+				}
 
 				op_str = blobmsg_get_string(tba[OCI_LINUX_SECCOMP_SYSCALLS_ARGS_OP]);
 				if (!resolve_op_ins(op_str))
@@ -383,12 +391,16 @@ struct sock_fprog *parseOCIlinuxseccomp(struct blob_attr *msg)
 		}
 	}
 
-	if (sz < 6)
+	if (sz < 6) {
+		ERROR("seccomp: filter is empty\n");
 		return NULL;
+	}
 
 	prog = malloc(sizeof(struct sock_fprog));
-	if (!prog)
+	if (!prog) {
+		ERROR("seccomp: failed to allocate sock_fprog\n");
 		return NULL;
+	}
 
 	filter = calloc(sz, sizeof(struct sock_filter));
 	if (!filter) {
@@ -420,8 +432,10 @@ struct sock_fprog *parseOCIlinuxseccomp(struct blob_attr *msg)
 		if (tbn[OCI_LINUX_SECCOMP_SYSCALLS_ERRNORET]) {
 			uint32_t errnoret;
 
-			if (action != SECCOMP_RET_ERRNO)
+			if (action != SECCOMP_RET_ERRNO) {
+				ERROR("seccomp: errnoRet set but action is not SCMP_ACT_ERRNO\n");
 				goto errout1;
+			}
 
 			errnoret = blobmsg_get_u32(tbn[OCI_LINUX_SECCOMP_SYSCALLS_ERRNORET]);
 			if (errnoret < 1 || errnoret > MAX_ERRNO) {
