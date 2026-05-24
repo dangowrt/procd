@@ -860,6 +860,13 @@ int cgroups_open_attr(const char *attr)
 	return open(path, O_RDONLY | O_CLOEXEC);
 }
 
+int cgroups_open_dir(void)
+{
+	if (!cgroup_path)
+		return -1;
+	return open(cgroup_path, O_PATH | O_DIRECTORY | O_CLOEXEC);
+}
+
 static int parseOCIlinuxcgroups_legacy_memory(struct blob_attr *msg, bool is_update)
 {
 	struct blob_attr *tb[__OCI_LINUX_CGROUPS_MEMORY_MAX];

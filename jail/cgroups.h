@@ -28,6 +28,7 @@ int cgroups_set_frozen(bool frozen);
 int cgroups_reclaim(int64_t bytes, int32_t swappiness);
 int64_t cgroups_read_int64(const char *attr);
 int cgroups_open_attr(const char *attr);
+int cgroups_open_dir(void);
 void cgroups_free(void);
 void cgroups_prepare(void);
 

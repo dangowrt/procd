@@ -3731,6 +3731,7 @@ container_handle_exec(struct ubus_context *ctx, struct ubus_object *obj,
 	bool exec_set_umask = opts.set_umask;
 	int console_sock_fd = -1;
 	bool console_sock_owned = false;
+	int cgroup_fd = -1;
 	int pipe_fds[2] = { -1, -1 };
 	pid_t exec_pid, grandchild = -1;
 	struct container_exec *e = NULL;
@@ -3893,6 +3894,10 @@ container_handle_exec(struct ubus_context *ctx, struct ubus_object *obj,
 			goto out;
 	}
 
+	cgroup_fd = cgroups_open_dir();
+	if (cgroup_fd < 0)
+		DEBUG("exec: cgroups_open_dir unavailable, will fall back to cgroups_attach_pid\n");
+
 	if (pipe(pipe_fds) < 0) {
 		ERROR("exec: pipe: %m\n");
 		goto out;
@@ -3937,7 +3942,16 @@ container_handle_exec(struct ubus_context *ctx, struct ubus_object *obj,
 			close(master_fd);
 		}
 
-		grandchild = fork();
+		{
+			struct clone_args gargs = {
+				.exit_signal = SIGCHLD,
+			};
+			if (cgroup_fd >= 0) {
+				gargs.flags = CLONE_INTO_CGROUP;
+				gargs.cgroup = (__u64)cgroup_fd;
+			}
+			grandchild = jail_clone3(&gargs);
+		}
 		if (grandchild < 0)
 			_exit(126);
 
@@ -4068,14 +4082,18 @@ container_handle_exec(struct ubus_context *ctx, struct ubus_object *obj,
 		console_sock_fd = -1;
 	}
 
+	if (cgroup_fd >= 0) {
+		close(cgroup_fd);
+		cgroup_fd = -1;
+	} else if (grandchild > 0) {
+		cgroups_attach_pid(grandchild);
+	}
+
 	container_exec_free_strarray(args);
 	container_exec_free_strarray(env);
 	args = env = NULL;
 	free(exec_additional_gids);
 	exec_additional_gids = NULL;
-
-	if (grandchild > 0)
-		cgroups_attach_pid(grandchild);
 
 	if (pidfile && grandchild > 0) {
 		FILE *pf = fopen(pidfile, "w");
@@ -4122,6 +4140,8 @@ out:
 		close(pipe_fds[1]);
 	if (console_sock_owned && console_sock_fd >= 0)
 		close(console_sock_fd);
+	if (cgroup_fd >= 0)
+		close(cgroup_fd);
 	container_exec_free_strarray(args);
 	container_exec_free_strarray(env);
 	free(exec_additional_gids);
