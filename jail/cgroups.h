@@ -19,6 +19,8 @@
 
 void cgroups_init(const char *p);
 int parseOCIlinuxcgroups(struct blob_attr *msg, bool is_update);
+void cgroups_create(void);
+void cgroups_configure(void);
 void cgroups_apply(pid_t pid);
 int cgroups_attach_pid(pid_t pid);
 int cgroups_kill_all(void);
