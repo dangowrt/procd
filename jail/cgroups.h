@@ -24,6 +24,7 @@ int cgroups_attach_pid(pid_t pid);
 int cgroups_kill_all(void);
 int cgroups_set_frozen(bool frozen);
 int64_t cgroups_read_int64(const char *attr);
+int cgroups_open_attr(const char *attr);
 void cgroups_free(void);
 void cgroups_prepare(void);
 

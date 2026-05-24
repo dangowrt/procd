@@ -3342,6 +3342,30 @@ static int handle_state(struct ubus_context *ctx, struct ubus_object *obj,
 		v = cgroups_read_int64("pids.peak");
 		if (v >= 0)
 			blobmsg_add_u64(&bb, "pidsPeak", (uint64_t)v);
+
+		int events_fd = cgroups_open_attr("memory.events.local");
+		if (events_fd >= 0) {
+			char ebuf[1024], *line, *next;
+			ssize_t en = read(events_fd, ebuf, sizeof(ebuf) - 1);
+
+			close(events_fd);
+			if (en > 0) {
+				void *sub = blobmsg_open_table(&bb, "memoryEventsLocal");
+
+				ebuf[en] = '\0';
+				next = ebuf;
+				while ((line = strsep(&next, "\n"))) {
+					char *space = strchr(line, ' ');
+
+					if (!space)
+						continue;
+					*space = '\0';
+					blobmsg_add_u64(&bb, line,
+							strtoull(space + 1, NULL, 10));
+				}
+				blobmsg_close_table(&bb, sub);
+			}
+		}
 	}
 
 	blobmsg_add_string(&bb, "bundle", opts.ocibundle);
