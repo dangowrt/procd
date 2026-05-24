@@ -52,6 +52,7 @@
 #include <linux/filter.h>
 #include <linux/limits.h>
 #include <linux/nsfs.h>
+#include <linux/sched.h>
 #include <linux/securebits.h>
 #include <signal.h>
 #include <inttypes.h>
@@ -78,7 +79,6 @@
 #define CLONE_NEWCGROUP 0x02000000
 #endif
 
-#define STACK_SIZE	(1024 * 1024)
 #define OPT_ARGS	"cC:d:De:EfFG:h:ij:J:ln:NoO:pP:r:R:sS:uU:w:t:T:yY:Z"
 
 struct hook_execvpe {
@@ -192,7 +192,10 @@ extern int pivot_root(const char *new_root, const char *put_old);
 
 int debug = 0;
 
-static char child_stack[STACK_SIZE];
+static long jail_clone3(struct clone_args *args)
+{
+	return syscall(SYS_clone3, args, sizeof(*args));
+}
 
 static struct ubus_context *parent_ctx;
 
@@ -4658,7 +4661,11 @@ static void post_main(struct uloop_timeout *t)
 			}
 		}
 
-		jail_process.pid = clone(exec_jail, child_stack + STACK_SIZE, SIGCHLD | (opts.namespace & (~CLONE_NEWCGROUP)), NULL);
+		struct clone_args cargs = {
+			.flags = opts.namespace & ~CLONE_NEWCGROUP,
+			.exit_signal = SIGCHLD,
+		};
+		jail_process.pid = jail_clone3(&cargs);
 	} else {
 		jail_process.pid = fork();
 	}
