@@ -48,6 +48,7 @@
 #include <fcntl.h>
 #include <sched.h>
 #include <limits.h>
+#include <linux/close_range.h>
 #include <linux/filter.h>
 #include <linux/limits.h>
 #include <linux/nsfs.h>
@@ -1973,6 +1974,7 @@ static void post_start_hook(void)
 
 	uloop_end();
 	free_opts(false);
+	syscall(SYS_close_range, 3, ~0U, CLOSE_RANGE_CLOEXEC);
 	INFO("exec-ing %s\n", *opts.jail_argv);
 	if (opts.envp) /* respect PATH if potentially set in ENV */
 		execvpe(*opts.jail_argv, opts.jail_argv, envp);
@@ -3826,6 +3828,7 @@ container_handle_exec(struct ubus_context *ctx, struct ubus_object *obj,
 				ERROR("exec: chdir(%s): %m\n", cwd);
 				_exit(127);
 			}
+			syscall(SYS_close_range, 3, ~0U, CLOSE_RANGE_CLOEXEC);
 			if (env)
 				execvpe(args[0], args, env);
 			else
