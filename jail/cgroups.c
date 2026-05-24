@@ -256,6 +256,12 @@ static void cgroups_compute_subtree_control(char *out, size_t outlen)
 		p[-1] = '\0';
 }
 
+void cgroups_destroy(void)
+{
+	if (cgroup_path)
+		(void)rmdir(cgroup_path);
+}
+
 void cgroups_create(void)
 {
 	char subtree_control[64] = { 0 };

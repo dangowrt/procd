@@ -4602,6 +4602,9 @@ static void post_main(struct uloop_timeout *t)
 	if (pipe(&pipes[0]) < 0 || pipe(&pipes[2]) < 0)
 		free_and_exit(-1);
 
+	if (opts.ocibundle)
+		cgroups_create();
+
 	if (has_namespaces()) {
 		if (opts.namespace & CLONE_NEWNS) {
 			if (!opts.extroot && (opts.user || opts.group)) {
@@ -4691,12 +4694,24 @@ static void post_main(struct uloop_timeout *t)
 			}
 		}
 
+		int init_cgroup_fd = -1;
 		struct clone_args cargs = {
 			.flags = (opts.namespace & ~CLONE_NEWCGROUP) | CLONE_PIDFD,
 			.pidfd = (__u64)(uintptr_t)&jail_process_pidfd,
 			.exit_signal = SIGCHLD,
 		};
+
+		if (opts.ocibundle) {
+			init_cgroup_fd = cgroups_open_dir();
+			if (init_cgroup_fd >= 0) {
+				cargs.flags |= CLONE_INTO_CGROUP;
+				cargs.cgroup = (__u64)init_cgroup_fd;
+			}
+		}
+
 		jail_process.pid = jail_clone3(&cargs);
+		if (init_cgroup_fd >= 0)
+			close(init_cgroup_fd);
 	} else {
 		jail_process.pid = fork();
 	}
@@ -4745,8 +4760,10 @@ static void post_main(struct uloop_timeout *t)
 		close(pipes[0]);
 		set_oom_score_adj();
 
-		if (opts.ocibundle)
-			cgroups_apply(jail_process.pid);
+		if (opts.ocibundle) {
+			cgroups_configure();
+			cgroups_attach_pid(jail_process.pid);
+		}
 
 		if (opts.namespace & CLONE_NEWUSER) {
 			if (write_setgroups(jail_process.pid, true)) {
@@ -4786,6 +4803,8 @@ static void post_main(struct uloop_timeout *t)
 		free_and_exit(exec_jail(NULL));
 	} else {
 		ERROR("failed to clone/fork: %m\n");
+		if (opts.ocibundle)
+			cgroups_destroy();
 		free_and_exit(EXIT_FAILURE);
 	}
 	run_hooks(opts.hooks.prestart, post_prestart);
