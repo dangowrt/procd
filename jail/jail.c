@@ -3342,6 +3342,340 @@ container_handle_kill(struct ubus_context *ctx, struct ubus_object *obj,
 }
 
 static int
+container_handle_update(struct ubus_context *ctx, struct ubus_object *obj,
+			struct ubus_request_data *req, const char *method,
+			struct blob_attr *msg)
+{
+	int rc;
+
+	if (jail_oci_state != OCI_STATE_CREATED &&
+	    jail_oci_state != OCI_STATE_RUNNING)
+		return UBUS_STATUS_INVALID_ARGUMENT;
+
+	if (!msg)
+		return UBUS_STATUS_INVALID_ARGUMENT;
+
+	rc = parseOCIlinuxcgroups(msg);
+	if (rc) {
+		switch (rc) {
+		case ENOTSUP:
+			return UBUS_STATUS_NOT_SUPPORTED;
+		case EINVAL:
+		case ENODATA:
+		case ERANGE:
+			return UBUS_STATUS_INVALID_ARGUMENT;
+		default:
+			return UBUS_STATUS_UNKNOWN_ERROR;
+		}
+	}
+
+	cgroups_apply(jail_process.pid);
+	return UBUS_STATUS_OK;
+}
+
+enum {
+	CONTAINER_EXEC_ATTR_ARGS,
+	CONTAINER_EXEC_ATTR_ENV,
+	CONTAINER_EXEC_ATTR_CWD,
+	CONTAINER_EXEC_ATTR_USER,
+	CONTAINER_EXEC_ATTR_PIDFILE,
+	CONTAINER_EXEC_ATTR_DETACH,
+	__CONTAINER_EXEC_ATTR_MAX,
+};
+
+static const struct blobmsg_policy container_exec_attrs[__CONTAINER_EXEC_ATTR_MAX] = {
+	[CONTAINER_EXEC_ATTR_ARGS]    = { "args",    BLOBMSG_TYPE_ARRAY  },
+	[CONTAINER_EXEC_ATTR_ENV]     = { "env",     BLOBMSG_TYPE_ARRAY  },
+	[CONTAINER_EXEC_ATTR_CWD]     = { "cwd",     BLOBMSG_TYPE_STRING },
+	[CONTAINER_EXEC_ATTR_USER]    = { "user",    BLOBMSG_TYPE_TABLE  },
+	[CONTAINER_EXEC_ATTR_PIDFILE] = { "pidfile", BLOBMSG_TYPE_STRING },
+	[CONTAINER_EXEC_ATTR_DETACH]  = { "detach",  BLOBMSG_TYPE_BOOL   },
+};
+
+enum {
+	CONTAINER_EXEC_USER_UID,
+	CONTAINER_EXEC_USER_GID,
+	__CONTAINER_EXEC_USER_MAX,
+};
+
+static const struct blobmsg_policy container_exec_user_attrs[__CONTAINER_EXEC_USER_MAX] = {
+	[CONTAINER_EXEC_USER_UID] = { "uid", BLOBMSG_TYPE_INT32 },
+	[CONTAINER_EXEC_USER_GID] = { "gid", BLOBMSG_TYPE_INT32 },
+};
+
+struct container_exec {
+	struct ubus_context *ctx;
+	struct ubus_request_data req;
+	struct uloop_process exec_proc;
+};
+
+static char **container_exec_strarray(struct blob_attr *arr)
+{
+	struct blob_attr *cur;
+	char **out;
+	int rem, n = 0;
+
+	blobmsg_for_each_attr(cur, arr, rem)
+		++n;
+
+	out = calloc(n + 1, sizeof(char *));
+	if (!out)
+		return NULL;
+
+	n = 0;
+	blobmsg_for_each_attr(cur, arr, rem)
+		out[n++] = strdup(blobmsg_get_string(cur));
+	out[n] = NULL;
+	return out;
+}
+
+static void container_exec_free_strarray(char **a)
+{
+	int i;
+
+	if (!a)
+		return;
+	for (i = 0; a[i]; i++)
+		free(a[i]);
+	free(a);
+}
+
+static void container_exec_done_reply(struct uloop_process *p, int wstatus)
+{
+	struct container_exec *e = container_of(p, struct container_exec, exec_proc);
+	static struct blob_buf bb;
+	int status;
+
+	if (WIFEXITED(wstatus))
+		status = WEXITSTATUS(wstatus);
+	else if (WIFSIGNALED(wstatus))
+		status = 128 + WTERMSIG(wstatus);
+	else
+		status = 255;
+
+	blob_buf_init(&bb, 0);
+	blobmsg_add_u32(&bb, "status", status);
+	ubus_send_reply(e->ctx, &e->req, bb.head);
+	ubus_complete_deferred_request(e->ctx, &e->req, 0);
+	free(e);
+}
+
+static void container_exec_done_reap(struct uloop_process *p, int wstatus)
+{
+	struct container_exec *e = container_of(p, struct container_exec, exec_proc);
+	free(e);
+}
+
+static int
+container_handle_exec(struct ubus_context *ctx, struct ubus_object *obj,
+		      struct ubus_request_data *req, const char *method,
+		      struct blob_attr *msg)
+{
+	struct blob_attr *tb[__CONTAINER_EXEC_ATTR_MAX];
+	struct blob_attr *tu[__CONTAINER_EXEC_USER_MAX] = { 0 };
+	static const char * const ns_names[] = { "user", "ipc", "uts", "net", "cgroup", "pid", "mnt" };
+	static const int ns_flags[] = {
+		CLONE_NEWUSER, CLONE_NEWIPC, CLONE_NEWUTS, CLONE_NEWNET,
+		CLONE_NEWCGROUP, CLONE_NEWPID, CLONE_NEWNS,
+	};
+	int ns_fds[7] = { -1, -1, -1, -1, -1, -1, -1 };
+	char **args = NULL, **env = NULL;
+	const char *cwd = "/", *pidfile = NULL;
+	uint32_t uid = 0, gid = 0;
+	bool detach = false;
+	int pipe_fds[2] = { -1, -1 };
+	pid_t exec_pid, grandchild = -1;
+	struct container_exec *e = NULL;
+	char nspath[64];
+	int i, rc = UBUS_STATUS_UNKNOWN_ERROR;
+
+	if (jail_oci_state != OCI_STATE_CREATED &&
+	    jail_oci_state != OCI_STATE_RUNNING)
+		return UBUS_STATUS_INVALID_ARGUMENT;
+	if (!msg)
+		return UBUS_STATUS_INVALID_ARGUMENT;
+
+	blobmsg_parse(container_exec_attrs, __CONTAINER_EXEC_ATTR_MAX, tb,
+		      blobmsg_data(msg), blobmsg_data_len(msg));
+
+	if (!tb[CONTAINER_EXEC_ATTR_ARGS])
+		return UBUS_STATUS_INVALID_ARGUMENT;
+
+	args = container_exec_strarray(tb[CONTAINER_EXEC_ATTR_ARGS]);
+	if (!args || !args[0]) {
+		rc = UBUS_STATUS_INVALID_ARGUMENT;
+		goto out;
+	}
+
+	if (tb[CONTAINER_EXEC_ATTR_ENV])
+		env = container_exec_strarray(tb[CONTAINER_EXEC_ATTR_ENV]);
+	if (tb[CONTAINER_EXEC_ATTR_CWD])
+		cwd = blobmsg_get_string(tb[CONTAINER_EXEC_ATTR_CWD]);
+	if (tb[CONTAINER_EXEC_ATTR_PIDFILE])
+		pidfile = blobmsg_get_string(tb[CONTAINER_EXEC_ATTR_PIDFILE]);
+	if (tb[CONTAINER_EXEC_ATTR_DETACH])
+		detach = blobmsg_get_bool(tb[CONTAINER_EXEC_ATTR_DETACH]);
+	if (tb[CONTAINER_EXEC_ATTR_USER]) {
+		blobmsg_parse(container_exec_user_attrs, __CONTAINER_EXEC_USER_MAX, tu,
+			      blobmsg_data(tb[CONTAINER_EXEC_ATTR_USER]),
+			      blobmsg_len(tb[CONTAINER_EXEC_ATTR_USER]));
+		if (tu[CONTAINER_EXEC_USER_UID])
+			uid = blobmsg_get_u32(tu[CONTAINER_EXEC_USER_UID]);
+		if (tu[CONTAINER_EXEC_USER_GID])
+			gid = blobmsg_get_u32(tu[CONTAINER_EXEC_USER_GID]);
+	}
+
+	for (i = 0; i < (int)ARRAY_SIZE(ns_names); i++) {
+		snprintf(nspath, sizeof(nspath), "/proc/%d/ns/%s",
+			 jail_process.pid, ns_names[i]);
+		ns_fds[i] = open(nspath, O_RDONLY | O_CLOEXEC);
+		if (ns_fds[i] < 0 &&
+		    ns_flags[i] != CLONE_NEWCGROUP &&
+		    ns_flags[i] != CLONE_NEWUSER) {
+			ERROR("exec: open %s: %m\n", nspath);
+			goto out;
+		}
+	}
+
+	if (pipe(pipe_fds) < 0) {
+		ERROR("exec: pipe: %m\n");
+		goto out;
+	}
+
+	exec_pid = fork();
+	if (exec_pid < 0) {
+		ERROR("exec: fork: %m\n");
+		goto out;
+	}
+
+	if (exec_pid == 0) {
+		int wstatus;
+
+		close(pipe_fds[0]);
+		for (i = 0; i < (int)ARRAY_SIZE(ns_names); i++) {
+			if (ns_fds[i] < 0)
+				continue;
+			if (setns(ns_fds[i], ns_flags[i]) < 0)
+				_exit(126);
+		}
+		grandchild = fork();
+		if (grandchild < 0)
+			_exit(126);
+
+		if (grandchild == 0) {
+			if (chdir(cwd) < 0)
+				_exit(127);
+			if (gid && setresgid(gid, gid, gid) < 0)
+				_exit(127);
+			if (uid && setresuid(uid, uid, uid) < 0)
+				_exit(127);
+			if (env)
+				execvpe(args[0], args, env);
+			else
+				execvp(args[0], args);
+			_exit(127);
+		}
+
+		(void)!write(pipe_fds[1], &grandchild, sizeof(grandchild));
+		close(pipe_fds[1]);
+
+		if (waitpid(grandchild, &wstatus, 0) < 0)
+			_exit(126);
+		if (WIFEXITED(wstatus))
+			_exit(WEXITSTATUS(wstatus));
+		_exit(128 + WTERMSIG(wstatus));
+	}
+
+	close(pipe_fds[1]);
+	pipe_fds[1] = -1;
+	{
+		char gcbuf[sizeof(pid_t)];
+		size_t off = 0;
+		ssize_t n;
+
+		while (off < sizeof(gcbuf)) {
+			n = read(pipe_fds[0], gcbuf + off, sizeof(gcbuf) - off);
+			if (n < 0) {
+				if (errno == EINTR)
+					continue;
+				grandchild = -1;
+				break;
+			}
+			if (n == 0) {
+				grandchild = -1;
+				break;
+			}
+			off += (size_t)n;
+		}
+		if (off == sizeof(gcbuf))
+			memcpy(&grandchild, gcbuf, sizeof(grandchild));
+		else
+			grandchild = -1;
+	}
+	close(pipe_fds[0]);
+	pipe_fds[0] = -1;
+
+	for (i = 0; i < (int)ARRAY_SIZE(ns_names); i++)
+		if (ns_fds[i] >= 0) {
+			close(ns_fds[i]);
+			ns_fds[i] = -1;
+		}
+
+	container_exec_free_strarray(args);
+	container_exec_free_strarray(env);
+	args = env = NULL;
+
+	if (grandchild > 0)
+		cgroups_attach_pid(grandchild);
+
+	if (pidfile && grandchild > 0) {
+		FILE *pf = fopen(pidfile, "w");
+		if (pf) {
+			fprintf(pf, "%d\n", grandchild);
+			fclose(pf);
+		}
+	}
+
+	e = calloc(1, sizeof(*e));
+	if (!e) {
+		kill(exec_pid, SIGKILL);
+		return UBUS_STATUS_UNKNOWN_ERROR;
+	}
+	e->ctx = ctx;
+	e->exec_proc.pid = exec_pid;
+
+	if (detach) {
+		static struct blob_buf bb;
+
+		blob_buf_init(&bb, 0);
+		if (grandchild > 0)
+			blobmsg_add_u32(&bb, "pid", grandchild);
+		ubus_send_reply(ctx, req, bb.head);
+
+		e->exec_proc.cb = container_exec_done_reap;
+		uloop_process_add(&e->exec_proc);
+		return UBUS_STATUS_OK;
+	}
+
+	e->exec_proc.cb = container_exec_done_reply;
+	uloop_process_add(&e->exec_proc);
+	ubus_defer_request(ctx, req, &e->req);
+	return UBUS_STATUS_OK;
+
+out:
+	for (i = 0; i < (int)ARRAY_SIZE(ns_names); i++)
+		if (ns_fds[i] >= 0)
+			close(ns_fds[i]);
+	if (pipe_fds[0] >= 0)
+		close(pipe_fds[0]);
+	if (pipe_fds[1] >= 0)
+		close(pipe_fds[1]);
+	container_exec_free_strarray(args);
+	container_exec_free_strarray(env);
+	return rc;
+}
+
+static int
 jail_writepid(pid_t pid)
 {
 	FILE *_pidfile;
@@ -3380,6 +3714,8 @@ static struct ubus_method container_methods[] = {
 	UBUS_METHOD_NOARG("start", handle_start),
 	UBUS_METHOD_NOARG("state", handle_state),
 	UBUS_METHOD("kill", container_handle_kill, container_kill_attrs),
+	UBUS_METHOD_NOARG("update", container_handle_update),
+	UBUS_METHOD("exec", container_handle_exec, container_exec_attrs),
 };
 
 static struct ubus_object_type container_object_type =

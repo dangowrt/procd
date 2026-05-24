@@ -99,6 +99,36 @@ void cgroups_free(void)
 	}
 }
 
+int cgroups_attach_pid(pid_t pid)
+{
+	char *ent;
+	int fd, ret = 0;
+	size_t len;
+
+	if (!cgroup_path)
+		return -ENODEV;
+
+	len = strlen(cgroup_path) + strlen("/cgroup.procs") + 1;
+	ent = malloc(len);
+	if (!ent)
+		return -ENOMEM;
+
+	snprintf(ent, len, "%s/cgroup.procs", cgroup_path);
+	fd = open(ent, O_WRONLY);
+	if (fd < 0) {
+		ret = -errno;
+		free(ent);
+		return ret;
+	}
+
+	if (dprintf(fd, "%d", pid) < 0)
+		ret = -errno;
+
+	close(fd);
+	free(ent);
+	return ret;
+}
+
 void cgroups_apply(pid_t pid)
 {
 	struct cgval *valp;
