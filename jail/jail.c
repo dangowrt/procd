@@ -3487,6 +3487,58 @@ container_handle_resume(struct ubus_context *ctx, struct ubus_object *obj,
 	return UBUS_STATUS_OK;
 }
 
+enum {
+	CONTAINER_RECLAIM_ATTR_BYTES,
+	CONTAINER_RECLAIM_ATTR_SWAPPINESS,
+	__CONTAINER_RECLAIM_ATTR_MAX,
+};
+
+static const struct blobmsg_policy container_reclaim_attrs[__CONTAINER_RECLAIM_ATTR_MAX] = {
+	[CONTAINER_RECLAIM_ATTR_BYTES]      = { "bytes",      BLOBMSG_CAST_INT64 },
+	[CONTAINER_RECLAIM_ATTR_SWAPPINESS] = { "swappiness", BLOBMSG_TYPE_INT32 },
+};
+
+static int
+container_handle_reclaim(struct ubus_context *ctx, struct ubus_object *obj,
+			 struct ubus_request_data *req, const char *method,
+			 struct blob_attr *msg)
+{
+	struct blob_attr *tb[__CONTAINER_RECLAIM_ATTR_MAX];
+	int64_t bytes;
+	int32_t swappiness = -1;
+	int rc;
+
+	if (jail_oci_state != OCI_STATE_CREATED &&
+	    jail_oci_state != OCI_STATE_RUNNING)
+		return UBUS_STATUS_INVALID_ARGUMENT;
+	if (!msg)
+		return UBUS_STATUS_INVALID_ARGUMENT;
+
+	blobmsg_parse(container_reclaim_attrs, __CONTAINER_RECLAIM_ATTR_MAX, tb,
+		      blobmsg_data(msg), blobmsg_data_len(msg));
+	if (!tb[CONTAINER_RECLAIM_ATTR_BYTES])
+		return UBUS_STATUS_INVALID_ARGUMENT;
+
+	bytes = blobmsg_cast_s64(tb[CONTAINER_RECLAIM_ATTR_BYTES]);
+	if (tb[CONTAINER_RECLAIM_ATTR_SWAPPINESS]) {
+		uint32_t s = blobmsg_get_u32(tb[CONTAINER_RECLAIM_ATTR_SWAPPINESS]);
+		if (s > 200)
+			return UBUS_STATUS_INVALID_ARGUMENT;
+		swappiness = (int32_t)s;
+	}
+
+	rc = cgroups_reclaim(bytes, swappiness);
+	if (rc == 0)
+		return UBUS_STATUS_OK;
+	if (rc == -EAGAIN)
+		return UBUS_STATUS_TIMEOUT;
+	if (rc == -EINVAL)
+		return UBUS_STATUS_INVALID_ARGUMENT;
+	if (rc == -ENODEV)
+		return UBUS_STATUS_NOT_SUPPORTED;
+	return UBUS_STATUS_UNKNOWN_ERROR;
+}
+
 static int
 container_handle_update(struct ubus_context *ctx, struct ubus_object *obj,
 			struct ubus_request_data *req, const char *method,
@@ -4108,6 +4160,7 @@ static struct ubus_method container_methods[] = {
 	UBUS_METHOD("kill", container_handle_kill, container_kill_attrs),
 	UBUS_METHOD_NOARG("pause", container_handle_pause),
 	UBUS_METHOD_NOARG("resume", container_handle_resume),
+	UBUS_METHOD("reclaim", container_handle_reclaim, container_reclaim_attrs),
 	UBUS_METHOD_NOARG("update", container_handle_update),
 	UBUS_METHOD("exec", container_handle_exec, container_exec_attrs),
 };

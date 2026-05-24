@@ -140,6 +140,33 @@ int cgroups_set_frozen(bool frozen)
 	return cgroups_write_attr("cgroup.freeze", frozen ? "1" : "0", 1);
 }
 
+int cgroups_reclaim(int64_t bytes, int32_t swappiness)
+{
+	char val[64];
+	int len, ret;
+	int attempt;
+
+	if (bytes < 0)
+		return -EINVAL;
+
+	if (swappiness >= 0)
+		len = snprintf(val, sizeof(val), "%" PRId64 " swappiness=%" PRId32,
+			       bytes, swappiness);
+	else
+		len = snprintf(val, sizeof(val), "%" PRId64, bytes);
+	if (len < 0 || len >= (int)sizeof(val))
+		return -EINVAL;
+
+	for (attempt = 0; attempt < 2; ++attempt) {
+		ret = cgroups_write_attr("memory.reclaim", val, len);
+		if (ret != -EINTR)
+			break;
+	}
+	if (ret == -ENOENT)
+		ret = -ENODEV;
+	return ret;
+}
+
 int cgroups_attach_pid(pid_t pid)
 {
 	char *ent;
