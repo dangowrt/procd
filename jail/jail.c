@@ -50,6 +50,7 @@
 #include <limits.h>
 #include <linux/close_range.h>
 #include <linux/filter.h>
+#include <linux/landlock.h>
 #include <linux/limits.h>
 #include <linux/nsfs.h>
 #include <linux/sched.h>
@@ -62,6 +63,7 @@
 #include "elf.h"
 #include "fs.h"
 #include "jail.h"
+#include "landlock.h"
 #include "log.h"
 #include "seccomp-oci.h"
 #include "cgroups.h"
@@ -195,6 +197,7 @@ static struct {
 		int priority;
 	} ioprio;
 	unsigned long mdwe_flags;
+	struct landlock_config landlock;
 } opts;
 
 static struct blob_buf ocibuf;
@@ -323,6 +326,7 @@ static void free_opts(bool parent) {
 	free(opts.uidmap);
 	free(opts.gidmap);
 	free(opts.annotations);
+	landlock_config_free(&opts.landlock);
 	free(opts.netdevices);
 	free(opts.extroot);
 	free(opts.overlaydir);
@@ -1997,6 +2001,11 @@ static void post_start_hook(void)
 	if (opts.cwd && chdir(opts.cwd))
 		free_and_exit(EXIT_FAILURE);
 
+	if (opts.landlock.n > 0 && landlock_apply(&opts.landlock)) {
+		ERROR("landlock_apply failed\n");
+		free_and_exit(EXIT_FAILURE);
+	}
+
 	if (opts.ociseccomp && applyOCIlinuxseccomp(opts.ociseccomp, opts.name, opts.ocibundle))
 		free_and_exit(EXIT_FAILURE);
 
@@ -3278,24 +3287,50 @@ static int parseOCI(const char *jsonfile)
 			const char *name = blobmsg_name(acur);
 			const char *val;
 
-			if (!name || strcmp(name, "org.openwrt.ujail.mdwe"))
-				continue;
-			if (blobmsg_type(acur) != BLOBMSG_TYPE_STRING)
+			if (!name || blobmsg_type(acur) != BLOBMSG_TYPE_STRING)
 				continue;
 
 			val = blobmsg_get_string(acur);
-			while (val && *val) {
-				size_t tlen;
-				const char *comma = strchr(val, ',');
 
-				tlen = comma ? (size_t)(comma - val) : strlen(val);
-				if (tlen == strlen("refuse_exec_gain") &&
-				    !strncmp(val, "refuse_exec_gain", tlen))
-					opts.mdwe_flags |= PR_MDWE_REFUSE_EXEC_GAIN;
-				else if (tlen == strlen("no_inherit") &&
-					 !strncmp(val, "no_inherit", tlen))
-					opts.mdwe_flags |= PR_MDWE_NO_INHERIT;
-				val = comma ? comma + 1 : NULL;
+			if (!strcmp(name, "org.openwrt.ujail.mdwe")) {
+				while (val && *val) {
+					size_t tlen;
+					const char *comma = strchr(val, ',');
+
+					tlen = comma ? (size_t)(comma - val) : strlen(val);
+					if (tlen == strlen("refuse_exec_gain") &&
+					    !strncmp(val, "refuse_exec_gain", tlen))
+						opts.mdwe_flags |= PR_MDWE_REFUSE_EXEC_GAIN;
+					else if (tlen == strlen("no_inherit") &&
+						 !strncmp(val, "no_inherit", tlen))
+						opts.mdwe_flags |= PR_MDWE_NO_INHERIT;
+					val = comma ? comma + 1 : NULL;
+				}
+			} else if (!strcmp(name, "org.openwrt.ujail.landlock.ro")) {
+				res = landlock_config_add_paths(&opts.landlock, val,
+					LANDLOCK_ACCESS_FS_READ_FILE |
+					LANDLOCK_ACCESS_FS_READ_DIR);
+				if (res)
+					goto errout;
+			} else if (!strcmp(name, "org.openwrt.ujail.landlock.rx")) {
+				res = landlock_config_add_paths(&opts.landlock, val,
+					LANDLOCK_ACCESS_FS_READ_FILE |
+					LANDLOCK_ACCESS_FS_READ_DIR |
+					LANDLOCK_ACCESS_FS_EXECUTE);
+				if (res)
+					goto errout;
+			} else if (!strcmp(name, "org.openwrt.ujail.landlock.rw")) {
+				res = landlock_config_add_paths(&opts.landlock, val,
+					LANDLOCK_ACCESS_FS_READ_FILE |
+					LANDLOCK_ACCESS_FS_READ_DIR |
+					LANDLOCK_ACCESS_FS_WRITE_FILE |
+					LANDLOCK_ACCESS_FS_TRUNCATE |
+					LANDLOCK_ACCESS_FS_MAKE_REG |
+					LANDLOCK_ACCESS_FS_MAKE_DIR |
+					LANDLOCK_ACCESS_FS_REMOVE_FILE |
+					LANDLOCK_ACCESS_FS_REMOVE_DIR);
+				if (res)
+					goto errout;
 			}
 
 			if ((opts.mdwe_flags & PR_MDWE_NO_INHERIT) &&
@@ -3305,6 +3340,9 @@ static int parseOCI(const char *jsonfile)
 				goto errout;
 			}
 		}
+
+		if (opts.landlock.n > 0)
+			opts.no_new_privs = 1;
 	}
 
 errout:
