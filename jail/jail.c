@@ -3328,8 +3328,21 @@ static int handle_state(struct ubus_context *ctx, struct ubus_object *obj,
 	blobmsg_add_string(&bb, "status", statusstr);
 	if (jail_oci_state == OCI_STATE_CREATED ||
 	    jail_oci_state == OCI_STATE_RUNNING ||
-	    jail_oci_state == OCI_STATE_PAUSED)
+	    jail_oci_state == OCI_STATE_PAUSED) {
+		int64_t v;
+
 		blobmsg_add_u32(&bb, "pid", jail_process.pid);
+
+		v = cgroups_read_int64("memory.peak");
+		if (v >= 0)
+			blobmsg_add_u64(&bb, "memoryPeak", (uint64_t)v);
+		v = cgroups_read_int64("memory.swap.peak");
+		if (v >= 0)
+			blobmsg_add_u64(&bb, "memorySwapPeak", (uint64_t)v);
+		v = cgroups_read_int64("pids.peak");
+		if (v >= 0)
+			blobmsg_add_u64(&bb, "pidsPeak", (uint64_t)v);
+	}
 
 	blobmsg_add_string(&bb, "bundle", opts.ocibundle);
 

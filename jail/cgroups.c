@@ -788,6 +788,17 @@ static int64_t read_int64_file(const char *path)
 	return v;
 }
 
+int64_t cgroups_read_int64(const char *attr)
+{
+	char path[PATH_MAX];
+
+	if (!cgroup_path)
+		return -1;
+
+	snprintf(path, sizeof(path), "%s/%s", cgroup_path, attr);
+	return read_int64_file(path);
+}
+
 static int parseOCIlinuxcgroups_legacy_memory(struct blob_attr *msg, bool is_update)
 {
 	struct blob_attr *tb[__OCI_LINUX_CGROUPS_MEMORY_MAX];
