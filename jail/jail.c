@@ -421,38 +421,59 @@ static int parse_inherited_console_fd(const char *spec)
 	return (int)fd;
 }
 
-static int send_console_fd(const char *spec, int console_fd, const char *slave_name)
+static int open_console_sock(const char *spec, bool *owned, bool path_only)
+{
+	int sock;
+	struct sockaddr_un addr = { .sun_family = AF_UNIX };
+
+	*owned = false;
+	if (!path_only) {
+		sock = parse_inherited_console_fd(spec);
+		if (sock >= 0) {
+			int dom = 0, typ = 0;
+			socklen_t slen = sizeof(dom);
+
+			if (getsockopt(sock, SOL_SOCKET, SO_DOMAIN, &dom, &slen) < 0 ||
+			    dom != AF_UNIX) {
+				ERROR("console-socket: inherited fd %d is not AF_UNIX\n", sock);
+				return -1;
+			}
+			slen = sizeof(typ);
+			if (getsockopt(sock, SOL_SOCKET, SO_TYPE, &typ, &slen) < 0 ||
+			    typ != SOCK_STREAM) {
+				ERROR("console-socket: inherited fd %d is not SOCK_STREAM\n", sock);
+				return -1;
+			}
+			return sock;
+		}
+	}
+
+	if (strlen(spec) >= sizeof(addr.sun_path)) {
+		ERROR("console-socket path too long: %s\n", spec);
+		return -1;
+	}
+	memcpy(addr.sun_path, spec, strlen(spec) + 1);
+
+	sock = socket(AF_UNIX, SOCK_STREAM, 0);
+	if (sock < 0) {
+		ERROR("console-socket: socket(): %m\n");
+		return -1;
+	}
+	if (connect(sock, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+		ERROR("console-socket: connect(%s): %m\n", spec);
+		close(sock);
+		return -1;
+	}
+	*owned = true;
+	return sock;
+}
+
+static int sendmsg_console_fd(int sock, int console_fd, const char *slave_name)
 {
 	struct msghdr msg = { 0 };
 	struct cmsghdr *cmsg;
 	struct iovec iov;
 	char cbuf[CMSG_SPACE(sizeof(int))] = { 0 };
-	int sock;
-	bool own_sock = false;
-	int ret = -1;
-
-	sock = parse_inherited_console_fd(spec);
-	if (sock < 0) {
-		struct sockaddr_un addr = { .sun_family = AF_UNIX };
-
-		if (strlen(spec) >= sizeof(addr.sun_path)) {
-			ERROR("console-socket path too long: %s\n", spec);
-			return -1;
-		}
-		strncpy(addr.sun_path, spec, sizeof(addr.sun_path) - 1);
-
-		sock = socket(AF_UNIX, SOCK_STREAM, 0);
-		if (sock < 0) {
-			ERROR("console-socket: socket(): %m\n");
-			return -1;
-		}
-		if (connect(sock, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-			ERROR("console-socket: connect(%s): %m\n", spec);
-			close(sock);
-			return -1;
-		}
-		own_sock = true;
-	}
 
 	iov.iov_base = (void *)slave_name;
 	iov.iov_len = strlen(slave_name);
@@ -468,12 +489,22 @@ static int send_console_fd(const char *spec, int console_fd, const char *slave_n
 	memcpy(CMSG_DATA(cmsg), &console_fd, sizeof(int));
 
 	if (sendmsg(sock, &msg, 0) < 0) {
-		ERROR("console-socket: sendmsg(%s): %m\n", spec);
-		goto out;
+		ERROR("console-socket: sendmsg: %m\n");
+		return -1;
 	}
-	ret = 0;
-out:
-	if (own_sock)
+	return 0;
+}
+
+static int send_console_fd(const char *spec, int console_fd, const char *slave_name)
+{
+	bool owned;
+	int sock, ret;
+
+	sock = open_console_sock(spec, &owned, false);
+	if (sock < 0)
+		return -1;
+	ret = sendmsg_console_fd(sock, console_fd, slave_name);
+	if (owned)
 		close(sock);
 	return ret;
 }
@@ -3384,21 +3415,25 @@ enum {
 	CONTAINER_EXEC_ATTR_CAPABILITIES,
 	CONTAINER_EXEC_ATTR_RLIMITS,
 	CONTAINER_EXEC_ATTR_NO_NEW_PRIVS,
+	CONTAINER_EXEC_ATTR_TERMINAL,
+	CONTAINER_EXEC_ATTR_CONSOLE_SOCKET,
 	CONTAINER_EXEC_ATTR_PIDFILE,
 	CONTAINER_EXEC_ATTR_DETACH,
 	__CONTAINER_EXEC_ATTR_MAX,
 };
 
 static const struct blobmsg_policy container_exec_attrs[__CONTAINER_EXEC_ATTR_MAX] = {
-	[CONTAINER_EXEC_ATTR_ARGS]         = { "args",            BLOBMSG_TYPE_ARRAY  },
-	[CONTAINER_EXEC_ATTR_ENV]          = { "env",             BLOBMSG_TYPE_ARRAY  },
-	[CONTAINER_EXEC_ATTR_CWD]          = { "cwd",             BLOBMSG_TYPE_STRING },
-	[CONTAINER_EXEC_ATTR_USER]         = { "user",            BLOBMSG_TYPE_TABLE  },
-	[CONTAINER_EXEC_ATTR_CAPABILITIES] = { "capabilities",    BLOBMSG_TYPE_TABLE  },
-	[CONTAINER_EXEC_ATTR_RLIMITS]      = { "rlimits",         BLOBMSG_TYPE_ARRAY  },
-	[CONTAINER_EXEC_ATTR_NO_NEW_PRIVS] = { "noNewPrivileges", BLOBMSG_TYPE_BOOL   },
-	[CONTAINER_EXEC_ATTR_PIDFILE]      = { "pidfile",         BLOBMSG_TYPE_STRING },
-	[CONTAINER_EXEC_ATTR_DETACH]       = { "detach",          BLOBMSG_TYPE_BOOL   },
+	[CONTAINER_EXEC_ATTR_ARGS]           = { "args",            BLOBMSG_TYPE_ARRAY  },
+	[CONTAINER_EXEC_ATTR_ENV]            = { "env",             BLOBMSG_TYPE_ARRAY  },
+	[CONTAINER_EXEC_ATTR_CWD]            = { "cwd",             BLOBMSG_TYPE_STRING },
+	[CONTAINER_EXEC_ATTR_USER]           = { "user",            BLOBMSG_TYPE_TABLE  },
+	[CONTAINER_EXEC_ATTR_CAPABILITIES]   = { "capabilities",    BLOBMSG_TYPE_TABLE  },
+	[CONTAINER_EXEC_ATTR_RLIMITS]        = { "rlimits",         BLOBMSG_TYPE_ARRAY  },
+	[CONTAINER_EXEC_ATTR_NO_NEW_PRIVS]   = { "noNewPrivileges", BLOBMSG_TYPE_BOOL   },
+	[CONTAINER_EXEC_ATTR_TERMINAL]       = { "terminal",        BLOBMSG_TYPE_BOOL   },
+	[CONTAINER_EXEC_ATTR_CONSOLE_SOCKET] = { "consolesocket",   BLOBMSG_TYPE_STRING },
+	[CONTAINER_EXEC_ATTR_PIDFILE]        = { "pidfile",         BLOBMSG_TYPE_STRING },
+	[CONTAINER_EXEC_ATTR_DETACH]         = { "detach",          BLOBMSG_TYPE_BOOL   },
 };
 
 enum {
@@ -3494,8 +3529,10 @@ container_handle_exec(struct ubus_context *ctx, struct ubus_object *obj,
 	int ns_fds[7] = { -1, -1, -1, -1, -1, -1, -1 };
 	char **args = NULL, **env = NULL;
 	const char *cwd = "/", *pidfile = NULL;
+	const char *console_socket = NULL;
 	uint32_t uid, gid;
 	bool detach = false;
+	bool terminal = false;
 	bool exec_nnp = opts.no_new_privs;
 	struct jail_capset exec_capset = opts.capset;
 	struct rlimit exec_rlimits[RLIM_NLIMITS];
@@ -3505,6 +3542,8 @@ container_handle_exec(struct ubus_context *ctx, struct ubus_object *obj,
 	size_t exec_max_additional_gids;
 	mode_t exec_umask = opts.umask;
 	bool exec_set_umask = opts.set_umask;
+	int console_sock_fd = -1;
+	bool console_sock_owned = false;
 	int pipe_fds[2] = { -1, -1 };
 	pid_t exec_pid, grandchild = -1;
 	struct container_exec *e = NULL;
@@ -3563,6 +3602,10 @@ container_handle_exec(struct ubus_context *ctx, struct ubus_object *obj,
 		pidfile = blobmsg_get_string(tb[CONTAINER_EXEC_ATTR_PIDFILE]);
 	if (tb[CONTAINER_EXEC_ATTR_DETACH])
 		detach = blobmsg_get_bool(tb[CONTAINER_EXEC_ATTR_DETACH]);
+	if (tb[CONTAINER_EXEC_ATTR_TERMINAL])
+		terminal = blobmsg_get_bool(tb[CONTAINER_EXEC_ATTR_TERMINAL]);
+	if (tb[CONTAINER_EXEC_ATTR_CONSOLE_SOCKET])
+		console_socket = blobmsg_get_string(tb[CONTAINER_EXEC_ATTR_CONSOLE_SOCKET]);
 	if (tb[CONTAINER_EXEC_ATTR_NO_NEW_PRIVS])
 		exec_nnp = blobmsg_get_bool(tb[CONTAINER_EXEC_ATTR_NO_NEW_PRIVS]);
 	if (tb[CONTAINER_EXEC_ATTR_CAPABILITIES]) {
@@ -3647,6 +3690,18 @@ container_handle_exec(struct ubus_context *ctx, struct ubus_object *obj,
 		}
 	}
 
+	if (terminal != !!console_socket) {
+		ERROR("exec: terminal and consolesocket must be set together\n");
+		rc = UBUS_STATUS_INVALID_ARGUMENT;
+		goto out;
+	}
+
+	if (terminal && console_socket) {
+		console_sock_fd = open_console_sock(console_socket, &console_sock_owned, true);
+		if (console_sock_fd < 0)
+			goto out;
+	}
+
 	if (pipe(pipe_fds) < 0) {
 		ERROR("exec: pipe: %m\n");
 		goto out;
@@ -3660,6 +3715,7 @@ container_handle_exec(struct ubus_context *ctx, struct ubus_object *obj,
 
 	if (exec_pid == 0) {
 		int wstatus;
+		int slave_fd = -1;
 
 		close(pipe_fds[0]);
 		for (i = 0; i < (int)ARRAY_SIZE(ns_names); i++) {
@@ -3668,6 +3724,28 @@ container_handle_exec(struct ubus_context *ctx, struct ubus_object *obj,
 			if (setns(ns_fds[i], ns_flags[i]) < 0)
 				_exit(126);
 		}
+
+		if (terminal && console_sock_fd >= 0) {
+			int master_fd;
+			char *slave_name;
+
+			master_fd = posix_openpt(O_RDWR | O_NOCTTY);
+			if (master_fd < 0)
+				_exit(126);
+			if (grantpt(master_fd) || unlockpt(master_fd))
+				_exit(126);
+			slave_name = ptsname(master_fd);
+			if (!slave_name)
+				_exit(126);
+			slave_fd = open(slave_name, O_RDWR | O_NOCTTY);
+			if (slave_fd < 0)
+				_exit(126);
+			if (sendmsg_console_fd(console_sock_fd, master_fd, slave_name) < 0)
+				_exit(126);
+			close(console_sock_fd);
+			close(master_fd);
+		}
+
 		grandchild = fork();
 		if (grandchild < 0)
 			_exit(126);
@@ -3681,6 +3759,17 @@ container_handle_exec(struct ubus_context *ctx, struct ubus_object *obj,
 					ERROR("exec: setrlimit(%d): %m\n", j);
 					_exit(127);
 				}
+			if (slave_fd >= 0) {
+				if (setsid() < 0)
+					_exit(127);
+				if (ioctl(slave_fd, TIOCSCTTY, 0) < 0)
+					_exit(127);
+				dup2(slave_fd, STDIN_FILENO);
+				dup2(slave_fd, STDOUT_FILENO);
+				dup2(slave_fd, STDERR_FILENO);
+				if (slave_fd > STDERR_FILENO)
+					close(slave_fd);
+			}
 			if (exec_set_umask)
 				umask(exec_umask);
 
@@ -3734,6 +3823,9 @@ container_handle_exec(struct ubus_context *ctx, struct ubus_object *obj,
 			_exit(127);
 		}
 
+		if (slave_fd >= 0)
+			close(slave_fd);
+
 		(void)!write(pipe_fds[1], &grandchild, sizeof(grandchild));
 		close(pipe_fds[1]);
 
@@ -3778,6 +3870,11 @@ container_handle_exec(struct ubus_context *ctx, struct ubus_object *obj,
 			close(ns_fds[i]);
 			ns_fds[i] = -1;
 		}
+
+	if (console_sock_owned && console_sock_fd >= 0) {
+		close(console_sock_fd);
+		console_sock_fd = -1;
+	}
 
 	container_exec_free_strarray(args);
 	container_exec_free_strarray(env);
@@ -3830,6 +3927,8 @@ out:
 		close(pipe_fds[0]);
 	if (pipe_fds[1] >= 0)
 		close(pipe_fds[1]);
+	if (console_sock_owned && console_sock_fd >= 0)
+		close(console_sock_fd);
 	container_exec_free_strarray(args);
 	container_exec_free_strarray(env);
 	free(exec_additional_gids);

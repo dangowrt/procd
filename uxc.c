@@ -1112,8 +1112,10 @@ static int uxc_exec(const char *name, const char *process_file,
 	uint32_t id;
 	int ret;
 
-	if (tty || console_socket)
-		fprintf(stderr, "uxc: --tty/--console-socket not yet plumbed for exec\n");
+	if (tty && !console_socket) {
+		fprintf(stderr, "uxc: --tty requires --console-socket\n");
+		return -EINVAL;
+	}
 
 	blob_buf_init(&req, 0);
 
@@ -1142,6 +1144,10 @@ static int uxc_exec(const char *name, const char *process_file,
 		blobmsg_add_string(&req, "pidfile", pid_file);
 	if (detach)
 		blobmsg_add_u8(&req, "detach", 1);
+	if (tty)
+		blobmsg_add_u8(&req, "terminal", 1);
+	if (console_socket)
+		blobmsg_add_string(&req, "consolesocket", console_socket);
 
 	if (asprintf(&objname, "container.%s", name) == -1) {
 		blob_buf_free(&req);
