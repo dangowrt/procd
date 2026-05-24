@@ -3381,29 +3381,39 @@ enum {
 	CONTAINER_EXEC_ATTR_ENV,
 	CONTAINER_EXEC_ATTR_CWD,
 	CONTAINER_EXEC_ATTR_USER,
+	CONTAINER_EXEC_ATTR_CAPABILITIES,
+	CONTAINER_EXEC_ATTR_RLIMITS,
+	CONTAINER_EXEC_ATTR_NO_NEW_PRIVS,
 	CONTAINER_EXEC_ATTR_PIDFILE,
 	CONTAINER_EXEC_ATTR_DETACH,
 	__CONTAINER_EXEC_ATTR_MAX,
 };
 
 static const struct blobmsg_policy container_exec_attrs[__CONTAINER_EXEC_ATTR_MAX] = {
-	[CONTAINER_EXEC_ATTR_ARGS]    = { "args",    BLOBMSG_TYPE_ARRAY  },
-	[CONTAINER_EXEC_ATTR_ENV]     = { "env",     BLOBMSG_TYPE_ARRAY  },
-	[CONTAINER_EXEC_ATTR_CWD]     = { "cwd",     BLOBMSG_TYPE_STRING },
-	[CONTAINER_EXEC_ATTR_USER]    = { "user",    BLOBMSG_TYPE_TABLE  },
-	[CONTAINER_EXEC_ATTR_PIDFILE] = { "pidfile", BLOBMSG_TYPE_STRING },
-	[CONTAINER_EXEC_ATTR_DETACH]  = { "detach",  BLOBMSG_TYPE_BOOL   },
+	[CONTAINER_EXEC_ATTR_ARGS]         = { "args",            BLOBMSG_TYPE_ARRAY  },
+	[CONTAINER_EXEC_ATTR_ENV]          = { "env",             BLOBMSG_TYPE_ARRAY  },
+	[CONTAINER_EXEC_ATTR_CWD]          = { "cwd",             BLOBMSG_TYPE_STRING },
+	[CONTAINER_EXEC_ATTR_USER]         = { "user",            BLOBMSG_TYPE_TABLE  },
+	[CONTAINER_EXEC_ATTR_CAPABILITIES] = { "capabilities",    BLOBMSG_TYPE_TABLE  },
+	[CONTAINER_EXEC_ATTR_RLIMITS]      = { "rlimits",         BLOBMSG_TYPE_ARRAY  },
+	[CONTAINER_EXEC_ATTR_NO_NEW_PRIVS] = { "noNewPrivileges", BLOBMSG_TYPE_BOOL   },
+	[CONTAINER_EXEC_ATTR_PIDFILE]      = { "pidfile",         BLOBMSG_TYPE_STRING },
+	[CONTAINER_EXEC_ATTR_DETACH]       = { "detach",          BLOBMSG_TYPE_BOOL   },
 };
 
 enum {
 	CONTAINER_EXEC_USER_UID,
 	CONTAINER_EXEC_USER_GID,
+	CONTAINER_EXEC_USER_ADDITIONAL_GIDS,
+	CONTAINER_EXEC_USER_UMASK,
 	__CONTAINER_EXEC_USER_MAX,
 };
 
 static const struct blobmsg_policy container_exec_user_attrs[__CONTAINER_EXEC_USER_MAX] = {
-	[CONTAINER_EXEC_USER_UID] = { "uid", BLOBMSG_TYPE_INT32 },
-	[CONTAINER_EXEC_USER_GID] = { "gid", BLOBMSG_TYPE_INT32 },
+	[CONTAINER_EXEC_USER_UID]             = { "uid",            BLOBMSG_TYPE_INT32 },
+	[CONTAINER_EXEC_USER_GID]             = { "gid",            BLOBMSG_TYPE_INT32 },
+	[CONTAINER_EXEC_USER_ADDITIONAL_GIDS] = { "additionalGids", BLOBMSG_TYPE_ARRAY },
+	[CONTAINER_EXEC_USER_UMASK]           = { "umask",          BLOBMSG_TYPE_INT32 },
 };
 
 struct container_exec {
@@ -3484,8 +3494,17 @@ container_handle_exec(struct ubus_context *ctx, struct ubus_object *obj,
 	int ns_fds[7] = { -1, -1, -1, -1, -1, -1, -1 };
 	char **args = NULL, **env = NULL;
 	const char *cwd = "/", *pidfile = NULL;
-	uint32_t uid = 0, gid = 0;
+	uint32_t uid, gid;
 	bool detach = false;
+	bool exec_nnp = opts.no_new_privs;
+	struct jail_capset exec_capset = opts.capset;
+	struct rlimit exec_rlimits[RLIM_NLIMITS];
+	bool exec_rlimits_set[RLIM_NLIMITS] = { 0 };
+	gid_t *exec_additional_gids = NULL;
+	size_t exec_num_additional_gids = 0;
+	size_t exec_max_additional_gids;
+	mode_t exec_umask = opts.umask;
+	bool exec_set_umask = opts.set_umask;
 	int pipe_fds[2] = { -1, -1 };
 	pid_t exec_pid, grandchild = -1;
 	struct container_exec *e = NULL;
@@ -3497,6 +3516,32 @@ container_handle_exec(struct ubus_context *ctx, struct ubus_object *obj,
 		return UBUS_STATUS_INVALID_ARGUMENT;
 	if (!msg)
 		return UBUS_STATUS_INVALID_ARGUMENT;
+
+	uid = (opts.pw_uid > 0) ? (uint32_t)opts.pw_uid : 0;
+	gid = (opts.pw_gid > 0) ? (uint32_t)opts.pw_gid : 0;
+
+	for (i = 0; i < RLIM_NLIMITS; i++) {
+		if (opts.rlimits[i]) {
+			exec_rlimits[i] = *opts.rlimits[i];
+			exec_rlimits_set[i] = true;
+		}
+	}
+	{
+		long n_max = sysconf(_SC_NGROUPS_MAX);
+		if (n_max <= 0)
+			n_max = NGROUPS_MAX;
+		exec_max_additional_gids = (size_t)n_max;
+	}
+	if (opts.additional_gids && opts.num_additional_gids <= exec_max_additional_gids) {
+		exec_additional_gids = calloc(opts.num_additional_gids, sizeof(gid_t));
+		if (!exec_additional_gids) {
+			rc = UBUS_STATUS_UNKNOWN_ERROR;
+			goto out;
+		}
+		memcpy(exec_additional_gids, opts.additional_gids,
+		       opts.num_additional_gids * sizeof(gid_t));
+		exec_num_additional_gids = opts.num_additional_gids;
+	}
 
 	blobmsg_parse(container_exec_attrs, __CONTAINER_EXEC_ATTR_MAX, tb,
 		      blobmsg_data(msg), blobmsg_data_len(msg));
@@ -3518,6 +3563,38 @@ container_handle_exec(struct ubus_context *ctx, struct ubus_object *obj,
 		pidfile = blobmsg_get_string(tb[CONTAINER_EXEC_ATTR_PIDFILE]);
 	if (tb[CONTAINER_EXEC_ATTR_DETACH])
 		detach = blobmsg_get_bool(tb[CONTAINER_EXEC_ATTR_DETACH]);
+	if (tb[CONTAINER_EXEC_ATTR_NO_NEW_PRIVS])
+		exec_nnp = blobmsg_get_bool(tb[CONTAINER_EXEC_ATTR_NO_NEW_PRIVS]);
+	if (tb[CONTAINER_EXEC_ATTR_CAPABILITIES]) {
+		memset(&exec_capset, 0, sizeof(exec_capset));
+		if (parseOCIcapabilities(&exec_capset,
+					 tb[CONTAINER_EXEC_ATTR_CAPABILITIES])) {
+			rc = UBUS_STATUS_INVALID_ARGUMENT;
+			goto out;
+		}
+	}
+	if (tb[CONTAINER_EXEC_ATTR_RLIMITS]) {
+		struct blob_attr *cur;
+		int rem;
+
+		blobmsg_for_each_attr(cur, tb[CONTAINER_EXEC_ATTR_RLIMITS], rem) {
+			struct blob_attr *rl[__OCI_PROCESS_RLIMIT_MAX];
+			int rlt;
+
+			blobmsg_parse(oci_process_rlimit_policy, __OCI_PROCESS_RLIMIT_MAX,
+				      rl, blobmsg_data(cur), blobmsg_len(cur));
+			if (!rl[OCI_PROCESS_RLIMIT_TYPE] ||
+			    !rl[OCI_PROCESS_RLIMIT_SOFT] ||
+			    !rl[OCI_PROCESS_RLIMIT_HARD])
+				continue;
+			rlt = resolve_rlimit(blobmsg_get_string(rl[OCI_PROCESS_RLIMIT_TYPE]));
+			if (rlt < 0)
+				continue;
+			exec_rlimits[rlt].rlim_cur = blobmsg_cast_u64(rl[OCI_PROCESS_RLIMIT_SOFT]);
+			exec_rlimits[rlt].rlim_max = blobmsg_cast_u64(rl[OCI_PROCESS_RLIMIT_HARD]);
+			exec_rlimits_set[rlt] = true;
+		}
+	}
 	if (tb[CONTAINER_EXEC_ATTR_USER]) {
 		blobmsg_parse(container_exec_user_attrs, __CONTAINER_EXEC_USER_MAX, tu,
 			      blobmsg_data(tb[CONTAINER_EXEC_ATTR_USER]),
@@ -3526,6 +3603,36 @@ container_handle_exec(struct ubus_context *ctx, struct ubus_object *obj,
 			uid = blobmsg_get_u32(tu[CONTAINER_EXEC_USER_UID]);
 		if (tu[CONTAINER_EXEC_USER_GID])
 			gid = blobmsg_get_u32(tu[CONTAINER_EXEC_USER_GID]);
+		if (tu[CONTAINER_EXEC_USER_UMASK]) {
+			exec_umask = blobmsg_get_u32(tu[CONTAINER_EXEC_USER_UMASK]);
+			exec_set_umask = true;
+		}
+		if (tu[CONTAINER_EXEC_USER_ADDITIONAL_GIDS]) {
+			struct blob_attr *cur;
+			int rem;
+			size_t count = 0;
+
+			blobmsg_for_each_attr(cur, tu[CONTAINER_EXEC_USER_ADDITIONAL_GIDS], rem)
+				count++;
+
+			if (count > exec_max_additional_gids)
+				count = exec_max_additional_gids;
+
+			free(exec_additional_gids);
+			exec_additional_gids = count ? calloc(count, sizeof(gid_t)) : NULL;
+			if (count && !exec_additional_gids) {
+				rc = UBUS_STATUS_UNKNOWN_ERROR;
+				goto out;
+			}
+
+			exec_num_additional_gids = 0;
+			blobmsg_for_each_attr(cur, tu[CONTAINER_EXEC_USER_ADDITIONAL_GIDS], rem) {
+				if (exec_num_additional_gids >= count)
+					break;
+				exec_additional_gids[exec_num_additional_gids++] =
+					blobmsg_get_u32(cur);
+			}
+		}
 	}
 
 	for (i = 0; i < (int)ARRAY_SIZE(ns_names); i++) {
@@ -3566,16 +3673,64 @@ container_handle_exec(struct ubus_context *ctx, struct ubus_object *obj,
 			_exit(126);
 
 		if (grandchild == 0) {
-			if (chdir(cwd) < 0)
+			int j;
+
+			for (j = 0; j < RLIM_NLIMITS; j++)
+				if (exec_rlimits_set[j] &&
+				    setrlimit(j, &exec_rlimits[j]) < 0) {
+					ERROR("exec: setrlimit(%d): %m\n", j);
+					_exit(127);
+				}
+			if (exec_set_umask)
+				umask(exec_umask);
+
+			if ((uid || gid || exec_num_additional_gids) &&
+			    exec_capset.apply) {
+				if (prctl(PR_SET_SECUREBITS, SECBIT_NO_SETUID_FIXUP)) {
+					ERROR("exec: prctl(PR_SET_SECUREBITS): %m\n");
+					_exit(127);
+				}
+				if (applyOCIcapabilities(exec_capset,
+							 (1LLU << CAP_SETGID) |
+							 (1LLU << CAP_SETUID) |
+							 (1LLU << CAP_SETPCAP))) {
+					ERROR("exec: applyOCIcapabilities(pre): failed\n");
+					_exit(127);
+				}
+			}
+
+			if (setgroups(exec_num_additional_gids,
+				      exec_num_additional_gids ? exec_additional_gids : NULL) < 0) {
+				ERROR("exec: setgroups: %m\n");
 				_exit(127);
-			if (gid && setresgid(gid, gid, gid) < 0)
+			}
+			if (gid && setresgid(gid, gid, gid) < 0) {
+				ERROR("exec: setresgid(%u): %m\n", gid);
 				_exit(127);
-			if (uid && setresuid(uid, uid, uid) < 0)
+			}
+			if (uid && setresuid(uid, uid, uid) < 0) {
+				ERROR("exec: setresuid(%u): %m\n", uid);
 				_exit(127);
+			}
+
+			if (exec_capset.apply &&
+			    applyOCIcapabilities(exec_capset, 0)) {
+				ERROR("exec: applyOCIcapabilities: failed\n");
+				_exit(127);
+			}
+			if (exec_nnp && prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0)) {
+				ERROR("exec: prctl(PR_SET_NO_NEW_PRIVS): %m\n");
+				_exit(127);
+			}
+			if (chdir(cwd) < 0) {
+				ERROR("exec: chdir(%s): %m\n", cwd);
+				_exit(127);
+			}
 			if (env)
 				execvpe(args[0], args, env);
 			else
 				execvp(args[0], args);
+			ERROR("exec: execvpe(%s): %m\n", args[0]);
 			_exit(127);
 		}
 
@@ -3627,6 +3782,8 @@ container_handle_exec(struct ubus_context *ctx, struct ubus_object *obj,
 	container_exec_free_strarray(args);
 	container_exec_free_strarray(env);
 	args = env = NULL;
+	free(exec_additional_gids);
+	exec_additional_gids = NULL;
 
 	if (grandchild > 0)
 		cgroups_attach_pid(grandchild);
@@ -3675,6 +3832,7 @@ out:
 		close(pipe_fds[1]);
 	container_exec_free_strarray(args);
 	container_exec_free_strarray(env);
+	free(exec_additional_gids);
 	return rc;
 }
 
