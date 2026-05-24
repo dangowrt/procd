@@ -3457,6 +3457,8 @@ struct container_exec {
 	struct uloop_process exec_proc;
 };
 
+static struct container_exec *current_exec;
+
 static char **container_exec_strarray(struct blob_attr *arr)
 {
 	struct blob_attr *cur;
@@ -3505,12 +3507,17 @@ static void container_exec_done_reply(struct uloop_process *p, int wstatus)
 	blobmsg_add_u32(&bb, "status", status);
 	ubus_send_reply(e->ctx, &e->req, bb.head);
 	ubus_complete_deferred_request(e->ctx, &e->req, 0);
+	if (current_exec == e)
+		current_exec = NULL;
 	free(e);
 }
 
 static void container_exec_done_reap(struct uloop_process *p, int wstatus)
 {
 	struct container_exec *e = container_of(p, struct container_exec, exec_proc);
+
+	if (current_exec == e)
+		current_exec = NULL;
 	free(e);
 }
 
@@ -3555,6 +3562,10 @@ container_handle_exec(struct ubus_context *ctx, struct ubus_object *obj,
 		return UBUS_STATUS_INVALID_ARGUMENT;
 	if (!msg)
 		return UBUS_STATUS_INVALID_ARGUMENT;
+	if (current_exec) {
+		ERROR("exec: another exec is already in progress\n");
+		return UBUS_STATUS_PERMISSION_DENIED;
+	}
 
 	uid = (opts.pw_uid > 0) ? (uint32_t)opts.pw_uid : 0;
 	gid = (opts.pw_gid > 0) ? (uint32_t)opts.pw_gid : 0;
@@ -3900,6 +3911,7 @@ container_handle_exec(struct ubus_context *ctx, struct ubus_object *obj,
 	}
 	e->ctx = ctx;
 	e->exec_proc.pid = exec_pid;
+	current_exec = e;
 
 	if (detach) {
 		static struct blob_buf bb;
