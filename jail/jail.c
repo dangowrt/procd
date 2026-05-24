@@ -22,8 +22,10 @@
 #include <sys/stat.h>
 #include <sys/sysmacros.h>
 #include <sys/ioctl.h>
+#include <sys/mman.h>
 #include <sys/personality.h>
 #include <sys/syscall.h>
+#include <sys/sendfile.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <linux/rtnetlink.h>
@@ -52,6 +54,7 @@
 #include <linux/filter.h>
 #include <linux/landlock.h>
 #include <linux/limits.h>
+#include <linux/memfd.h>
 #include <linux/nsfs.h>
 #include <linux/sched.h>
 #include <linux/securebits.h>
@@ -1145,6 +1148,110 @@ static int apply_rlimits(void)
 	return 0;
 }
 
+static int preload_memfd_fd = -1;
+
+static int preload_load_deps(void)
+{
+	const char *path;
+	struct stat st;
+	char *map;
+	int fd, rc;
+
+	if (add_path_and_deps("libpreload-seccomp.so", 1, -1, 1))
+		return -1;
+
+	path = find_lib("libpreload-seccomp.so");
+	if (!path)
+		return -1;
+
+	fd = open(path, O_RDONLY | O_CLOEXEC);
+	if (fd < 0)
+		return -1;
+
+	if (fstat(fd, &st) < 0 || !S_ISREG(st.st_mode) || st.st_size < 4) {
+		close(fd);
+		return -1;
+	}
+
+	map = mmap(NULL, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+	close(fd);
+	if (map == MAP_FAILED)
+		return -1;
+
+	rc = elf_load_deps(path, map);
+	munmap(map, st.st_size);
+	return rc;
+}
+
+static int preload_to_memfd(const char *path)
+{
+	int src, mfd;
+	struct stat st;
+	off_t off = 0;
+
+	src = open(path, O_RDONLY | O_CLOEXEC);
+	if (src < 0) {
+		ERROR("preload: open(%s): %m\n", path);
+		return -1;
+	}
+	if (fstat(src, &st) < 0) {
+		ERROR("preload: fstat: %m\n");
+		close(src);
+		return -1;
+	}
+
+	if (!S_ISREG(st.st_mode) || st.st_size < 4) {
+		ERROR("preload: %s is too small or not a regular file\n", path);
+		close(src);
+		return -1;
+	}
+
+	mfd = syscall(SYS_memfd_create, "preload-seccomp",
+		      MFD_ALLOW_SEALING | MFD_EXEC);
+	if (mfd < 0) {
+		ERROR("preload: memfd_create: %m\n");
+		close(src);
+		return -1;
+	}
+
+	while (off < st.st_size) {
+		ssize_t n = sendfile(mfd, src, &off, st.st_size - off);
+
+		if (n < 0) {
+			if (errno == EINTR)
+				continue;
+			ERROR("preload: sendfile: %m\n");
+			close(src);
+			close(mfd);
+			return -1;
+		}
+		if (n == 0) {
+			ERROR("preload: short sendfile (%jd/%jd)\n",
+			      (intmax_t)off, (intmax_t)st.st_size);
+			close(src);
+			close(mfd);
+			return -1;
+		}
+	}
+	close(src);
+
+	if (off != st.st_size) {
+		ERROR("preload: short sendfile (%jd/%jd)\n",
+		      (intmax_t)off, (intmax_t)st.st_size);
+		close(mfd);
+		return -1;
+	}
+
+	if (fcntl(mfd, F_ADD_SEALS,
+		  F_SEAL_WRITE | F_SEAL_GROW | F_SEAL_SHRINK) < 0) {
+		ERROR("preload: F_ADD_SEALS: %m\n");
+		close(mfd);
+		return -1;
+	}
+
+	return mfd;
+}
+
 #define MAX_ENVP	64
 static char** build_envp(const char *seccomp, char **ocienvp)
 {
@@ -1168,7 +1275,11 @@ static char** build_envp(const char *seccomp, char **ocienvp)
 		envp[count++] = seccomp_var;
 		snprintf(seccomp_debug_var, sizeof(seccomp_debug_var), "SECCOMP_DEBUG=%2d", debug);
 		envp[count++] = seccomp_debug_var;
-		snprintf(preload_var, sizeof(preload_var), "LD_PRELOAD=%s", preload_lib);
+		preload_memfd_fd = preload_to_memfd(preload_lib);
+		if (preload_memfd_fd < 0)
+			return NULL;
+		snprintf(preload_var, sizeof(preload_var),
+			 "LD_PRELOAD=/proc/self/fd/%d", preload_memfd_fd);
 		envp[count++] = preload_var;
 	}
 
@@ -2012,6 +2123,9 @@ static void post_start_hook(void)
 	uloop_end();
 	free_opts(false);
 	syscall(SYS_close_range, 3, ~0U, CLOSE_RANGE_CLOEXEC);
+	/* keep the sealed preload memfd open across execve so ld.so can read it */
+	if (preload_memfd_fd >= 0)
+		fcntl(preload_memfd_fd, F_SETFD, 0);
 	INFO("exec-ing %s\n", *opts.jail_argv);
 	if (opts.envp) /* respect PATH if potentially set in ENV */
 		execvpe(*opts.jail_argv, opts.jail_argv, envp);
@@ -4654,8 +4768,8 @@ int main(int argc, char **argv)
 		}
 	}
 
-	if (opts.namespace && opts.seccomp && add_path_and_deps("libpreload-seccomp.so", 1, -1, 1)) {
-		ERROR("failed to load libpreload-seccomp.so\n");
+	if (opts.namespace && opts.seccomp && preload_load_deps()) {
+		ERROR("failed to load libpreload-seccomp.so dependencies\n");
 		opts.seccomp = 0;
 		if (opts.require_jail) {
 			ret=-1;
