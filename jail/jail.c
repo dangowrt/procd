@@ -79,6 +79,16 @@
 #define CLONE_NEWCGROUP 0x02000000
 #endif
 
+#ifndef PR_SET_MDWE
+#define PR_SET_MDWE 65
+#endif
+#ifndef PR_MDWE_REFUSE_EXEC_GAIN
+#define PR_MDWE_REFUSE_EXEC_GAIN (1UL << 0)
+#endif
+#ifndef PR_MDWE_NO_INHERIT
+#define PR_MDWE_NO_INHERIT (1UL << 1)
+#endif
+
 #define OPT_ARGS	"cC:d:De:EfFG:h:ij:J:ln:NoO:pP:r:R:sS:uU:w:t:T:yY:Z"
 
 struct hook_execvpe {
@@ -184,6 +194,7 @@ static struct {
 		int class;
 		int priority;
 	} ioprio;
+	unsigned long mdwe_flags;
 } opts;
 
 static struct blob_buf ocibuf;
@@ -1974,6 +1985,11 @@ static void post_start_hook(void)
 		free_and_exit(EXIT_FAILURE);
 	}
 
+	if (opts.mdwe_flags && prctl(PR_SET_MDWE, opts.mdwe_flags, 0, 0, 0)) {
+		ERROR("prctl(PR_SET_MDWE, 0x%lx) failed: %m\n", opts.mdwe_flags);
+		free_and_exit(EXIT_FAILURE);
+	}
+
 	char **envp = build_envp(opts.seccomp, opts.envp);
 	if (!envp)
 		free_and_exit(EXIT_FAILURE);
@@ -3252,8 +3268,44 @@ static int parseOCI(const char *jsonfile)
 	if (tb[OCI_HOOKS] && (res = parseOCIhooks(tb[OCI_HOOKS])))
 		goto errout;
 
-	if (tb[OCI_ANNOTATIONS])
+	if (tb[OCI_ANNOTATIONS]) {
+		struct blob_attr *acur;
+		int arem;
+
 		opts.annotations = blob_memdup(tb[OCI_ANNOTATIONS]);
+
+		blobmsg_for_each_attr(acur, tb[OCI_ANNOTATIONS], arem) {
+			const char *name = blobmsg_name(acur);
+			const char *val;
+
+			if (!name || strcmp(name, "org.openwrt.ujail.mdwe"))
+				continue;
+			if (blobmsg_type(acur) != BLOBMSG_TYPE_STRING)
+				continue;
+
+			val = blobmsg_get_string(acur);
+			while (val && *val) {
+				size_t tlen;
+				const char *comma = strchr(val, ',');
+
+				tlen = comma ? (size_t)(comma - val) : strlen(val);
+				if (tlen == strlen("refuse_exec_gain") &&
+				    !strncmp(val, "refuse_exec_gain", tlen))
+					opts.mdwe_flags |= PR_MDWE_REFUSE_EXEC_GAIN;
+				else if (tlen == strlen("no_inherit") &&
+					 !strncmp(val, "no_inherit", tlen))
+					opts.mdwe_flags |= PR_MDWE_NO_INHERIT;
+				val = comma ? comma + 1 : NULL;
+			}
+
+			if ((opts.mdwe_flags & PR_MDWE_NO_INHERIT) &&
+			    !(opts.mdwe_flags & PR_MDWE_REFUSE_EXEC_GAIN)) {
+				ERROR("mdwe: no_inherit requires refuse_exec_gain\n");
+				res = ENOTSUP;
+				goto errout;
+			}
+		}
+	}
 
 errout:
 	blob_buf_free(&ocibuf);
@@ -4014,6 +4066,11 @@ container_handle_exec(struct ubus_context *ctx, struct ubus_object *obj,
 			}
 			if (exec_nnp && prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0)) {
 				ERROR("exec: prctl(PR_SET_NO_NEW_PRIVS): %m\n");
+				_exit(127);
+			}
+			if (opts.mdwe_flags &&
+			    prctl(PR_SET_MDWE, opts.mdwe_flags, 0, 0, 0)) {
+				ERROR("exec: prctl(PR_SET_MDWE): %m\n");
 				_exit(127);
 			}
 			if (chdir(cwd) < 0) {
