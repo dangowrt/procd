@@ -371,6 +371,8 @@ static bool nullable_str_eq(const char *a, const char *b)
 	return !strcmp(a, b);
 }
 
+static bool mount_opts_has(const char *opts, const char *needle);
+
 static int _add_mount(const char *source, const char *target, const char *filesystemtype,
 		      unsigned long mountflags, unsigned long propflags, const char *optstr,
 		      int error, bool inner)
@@ -413,8 +415,28 @@ static int _add_mount(const char *source, const char *target, const char *filesy
 	if (filesystemtype)
 		m->filesystemtype = strdup(filesystemtype);
 
-	if (optstr)
+	if (filesystemtype && !strcmp(filesystemtype, "tmpfs") &&
+	    !mount_opts_has(optstr ?: "", "swap") &&
+	    !mount_opts_has(optstr ?: "", "noswap")) {
+		char *new_opts;
+		int rc;
+
+		if (optstr && *optstr)
+			rc = asprintf(&new_opts, "%s,noswap", optstr);
+		else
+			rc = asprintf(&new_opts, "noswap");
+		if (rc < 0) {
+			free((void *)m->target);
+			if (m->source && m->source != (void *)(-1))
+				free((void *)m->source);
+			free((void *)m->filesystemtype);
+			free(m);
+			return ENOMEM;
+		}
+		m->optstr = new_opts;
+	} else if (optstr) {
 		m->optstr = strdup(optstr);
+	}
 
 	m->mountflags = mountflags;
 	m->propflags = propflags;
@@ -631,6 +653,24 @@ static int parseOCImountopts(struct blob_attr *msg, unsigned long *mount_flags, 
 	DEBUG("mount flags(%08lx) propagation(%08lx) fsopts(\"%s\")\n", mf, pf, *mount_data?:"");
 
 	return 0;
+}
+
+static bool mount_opts_has(const char *opts, const char *needle)
+{
+	size_t nlen = strlen(needle);
+	const char *p = opts;
+
+	while (p && *p) {
+		const char *end = strchr(p, ',');
+		size_t plen = end ? (size_t)(end - p) : strlen(p);
+
+		if (plen == nlen && !strncmp(p, needle, nlen))
+			return true;
+		if (!end)
+			break;
+		p = end + 1;
+	}
+	return false;
 }
 
 int parseOCImount(struct blob_attr *msg)
