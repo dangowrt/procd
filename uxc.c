@@ -104,6 +104,7 @@ static const struct option start_opts[] = {
 
 static const struct option kill_opts[] = {
 	{"signal",		required_argument,	0,	's'	},
+	{"all",			no_argument,		0,	'a'	},
 	{0,			0,			0,	0	}
 };
 
@@ -282,7 +283,7 @@ static int usage(void) {
 	printf("\t\t[--mounts <v1>,<v2>,...,<vN>]\t\trequire filesystems to be available\n");
 	printf("\tstart [--console] <conf>\t\tstart container <conf>\n");
 	printf("\tstate <conf>\t\t\t\tget state of container <conf>\n");
-	printf("\tkill [--signal <signal>] <conf> [<signal>]\tsend signal (default SIGTERM) to container <conf>\n");
+	printf("\tkill [--signal <signal>] [--all] <conf> [<signal>]\tsend signal (default SIGTERM) to container <conf>; --all + KILL kills every process in the cgroup\n");
 	printf("\tenable <conf>\t\t\t\tstart container <conf> on boot\n");
 	printf("\tdisable <conf>\t\t\t\tdon't start container <conf> on boot\n");
 	printf("\tdelete <conf> [--force]\t\t\tdelete <conf>\n");
@@ -1207,7 +1208,7 @@ static int uxc_update(const char *name, const char *resources_file)
 	return ret ? -EIO : 0;
 }
 
-static int uxc_kill(char *name, int signal)
+static int uxc_kill(char *name, int signal, bool all)
 {
 	static struct blob_buf req;
 	struct blob_attr *cur, *tb[__CONF_MAX];
@@ -1240,6 +1241,8 @@ static int uxc_kill(char *name, int signal)
 	blob_buf_init(&req, 0);
 	blobmsg_add_u32(&req, "signal", signal);
 	blobmsg_add_string(&req, "name", name);
+	if (all)
+		blobmsg_add_u8(&req, "all", 1);
 
 	if (asprintf(&objname, "container.%s", name) == -1)
 		return -ENOMEM;
@@ -1620,7 +1623,7 @@ static int uxc_delete(char *name, bool force)
 
 	if (rsstate && rsstate->running) {
 		if (force) {
-			ret = uxc_kill(name, SIGKILL);
+			ret = uxc_kill(name, SIGKILL, true);
 			if (ret)
 				goto errout;
 
@@ -1874,14 +1877,18 @@ next_global:
 	} else if (!strcmp(verb, "kill")) {
 		int signal = SIGTERM;
 		bool signal_from_flag = false;
+		bool all = false;
 
-		while ((c = getopt_long(verb_argc, verb_argv, "+s:", kill_opts, NULL)) != -1) {
+		while ((c = getopt_long(verb_argc, verb_argv, "+s:a", kill_opts, NULL)) != -1) {
 			switch (c) {
 			case 's':
 				signal = get_signum(optarg);
 				if (signal < 0)
 					goto usage_out;
 				signal_from_flag = true;
+				break;
+			case 'a':
+				all = true;
 				break;
 			default: goto usage_out;
 			}
@@ -1895,7 +1902,12 @@ next_global:
 		} else if (optind != verb_argc - 1) {
 			goto usage_out;
 		}
-		ret = uxc_kill(verb_argv[optind], signal);
+		if (all && signal != SIGKILL) {
+			fprintf(stderr, "uxc: --all is only valid with SIGKILL\n");
+			ret = -ENOTSUP;
+			goto runtime_out;
+		}
+		ret = uxc_kill(verb_argv[optind], signal, all);
 	} else if (!strcmp(verb, "enable")) {
 		if (verb_argc != 2)
 			goto usage_out;

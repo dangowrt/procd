@@ -3338,11 +3338,13 @@ static int handle_state(struct ubus_context *ctx, struct ubus_object *obj,
 
 enum {
 	CONTAINER_KILL_ATTR_SIGNAL,
+	CONTAINER_KILL_ATTR_ALL,
 	__CONTAINER_KILL_ATTR_MAX,
 };
 
 static const struct blobmsg_policy container_kill_attrs[__CONTAINER_KILL_ATTR_MAX] = {
 	[CONTAINER_KILL_ATTR_SIGNAL] = { "signal", BLOBMSG_TYPE_INT32 },
+	[CONTAINER_KILL_ATTR_ALL]    = { "all",    BLOBMSG_TYPE_BOOL  },
 };
 
 static int
@@ -3352,6 +3354,7 @@ container_handle_kill(struct ubus_context *ctx, struct ubus_object *obj,
 {
 	struct blob_attr *tb[__CONTAINER_KILL_ATTR_MAX], *cur;
 	int sig = SIGTERM;
+	bool all = false;
 
 	blobmsg_parse(container_kill_attrs, __CONTAINER_KILL_ATTR_MAX, tb, blobmsg_data(msg), blobmsg_data_len(msg));
 
@@ -3359,8 +3362,19 @@ container_handle_kill(struct ubus_context *ctx, struct ubus_object *obj,
 	if (cur)
 		sig = blobmsg_get_u32(cur);
 
+	cur = tb[CONTAINER_KILL_ATTR_ALL];
+	if (cur)
+		all = blobmsg_get_bool(cur);
+
 	if (jail_oci_state == OCI_STATE_CREATING)
 		return UBUS_STATUS_NOT_FOUND;
+
+	if (all && sig == SIGKILL) {
+		int rc = cgroups_kill_all();
+		if (rc == 0)
+			return 0;
+		DEBUG("cgroup.kill unavailable (%d), falling back to per-pid kill\n", rc);
+	}
 
 	if (kill(jail_process.pid, sig) == 0)
 		return 0;

@@ -100,6 +100,36 @@ void cgroups_free(void)
 	}
 }
 
+int cgroups_kill_all(void)
+{
+	char *ent;
+	int fd, ret = 0;
+	size_t len;
+
+	if (!cgroup_path)
+		return -ENODEV;
+
+	len = strlen(cgroup_path) + strlen("/cgroup.kill") + 1;
+	ent = malloc(len);
+	if (!ent)
+		return -ENOMEM;
+
+	snprintf(ent, len, "%s/cgroup.kill", cgroup_path);
+	fd = open(ent, O_WRONLY);
+	if (fd < 0) {
+		ret = -errno;
+		free(ent);
+		return ret;
+	}
+
+	if (write(fd, "1", 1) < 0)
+		ret = -errno;
+
+	close(fd);
+	free(ent);
+	return ret;
+}
+
 int cgroups_attach_pid(pid_t pid)
 {
 	char *ent;
