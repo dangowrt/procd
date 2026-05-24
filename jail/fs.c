@@ -84,6 +84,13 @@ int sys_mount_setattr(int dfd, const char *path, unsigned int flags,
 	return syscall(SYS_mount_setattr, dfd, path, flags, attr, size);
 }
 
+int sys_openat2(int dfd, const char *path, struct open_how *how, size_t size)
+{
+	return syscall(SYS_openat2, dfd, path, how, size);
+}
+
+static int jailroot_dirfd = -1;
+
 static int write_mappings_file(pid_t pid, const char *which, struct blob_attr *mappings)
 {
 	enum {
@@ -292,9 +299,21 @@ static int do_mount(const char *root, const char *orig_source, const char *targe
 	if (!is_bind || (source && S_ISDIR(s.st_mode))) {
 		mkdir_p(new, 0755);
 	} else if (is_bind && source) {
+		const char *target_rel = target ? target : source;
+		struct open_how how = {
+			.flags = O_CREAT | O_WRONLY | O_TRUNC | O_EXCL | O_CLOEXEC,
+			.mode = 0644,
+			.resolve = RESOLVE_BENEATH | RESOLVE_NO_MAGICLINKS,
+		};
+
+		assert(target_rel);
 		mkdir_p(dirname(new), 0755);
 		snprintf(new, sizeof(new), "%s%s", root, target?target:source);
-		fd = open(new, O_CREAT|O_WRONLY|O_TRUNC|O_EXCL, 0644);
+		while (*target_rel == '/')
+			++target_rel;
+		fd = (jailroot_dirfd >= 0)
+		     ? sys_openat2(jailroot_dirfd, target_rel, &how, sizeof(how))
+		     : open(new, O_CREAT|O_WRONLY|O_TRUNC|O_EXCL|O_CLOEXEC, 0644);
 		if (fd >= 0)
 			close(fd);
 
@@ -729,10 +748,22 @@ static int do_idmap_mount(const char *root, struct mount *m)
 	if (S_ISDIR(s.st_mode)) {
 		mkdir_p(target, 0755);
 	} else {
+		const char *target_rel = m->target;
+		struct open_how how = {
+			.flags = O_CREAT | O_WRONLY | O_TRUNC | O_CLOEXEC,
+			.mode = 0644,
+			.resolve = RESOLVE_BENEATH | RESOLVE_NO_MAGICLINKS,
+		};
 		int fd;
+
+		assert(target_rel);
 		mkdir_p(dirname(strdupa(target)), 0755);
 		snprintf(target, sizeof(target), "%s%s", root, m->target);
-		fd = open(target, O_CREAT | O_WRONLY | O_TRUNC, 0644);
+		while (*target_rel == '/')
+			++target_rel;
+		fd = (jailroot_dirfd >= 0)
+		     ? sys_openat2(jailroot_dirfd, target_rel, &how, sizeof(how))
+		     : open(target, O_CREAT | O_WRONLY | O_TRUNC | O_CLOEXEC, 0644);
 		if (fd >= 0)
 			close(fd);
 	}
@@ -807,23 +838,36 @@ out_close:
 int mount_all(const char *jailroot) {
 	struct library *l;
 	struct mount *m;
+	int ret = 0;
 
 	build_noafile();
+
+	jailroot_dirfd = open(jailroot, O_PATH | O_DIRECTORY | O_CLOEXEC);
+	if (jailroot_dirfd < 0)
+		ERROR("mount_all: open(%s, O_PATH|O_DIRECTORY): %m\n", jailroot);
 
 	avl_for_each_element(&libraries, l, avl)
 		add_mount_bind(l->path, 1, -1);
 
 	avl_for_each_element(&mounts, m, avl) {
 		if (m->idmap) {
-			if (do_idmap_mount(jailroot, m))
-				return -1;
+			if (do_idmap_mount(jailroot, m)) {
+				ret = -1;
+				goto out;
+			}
 		} else if (do_mount(jailroot, m->source, m->target, m->filesystemtype, m->mountflags,
 				    m->propflags, m->optstr, m->error, m->inner)) {
-			return -1;
+			ret = -1;
+			goto out;
 		}
 	}
 
-	return 0;
+out:
+	if (jailroot_dirfd >= 0) {
+		close(jailroot_dirfd);
+		jailroot_dirfd = -1;
+	}
+	return ret;
 }
 
 void mount_free(void) {

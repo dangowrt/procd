@@ -3972,7 +3972,11 @@ jail_writepid(pid_t pid)
 
 static int checkpath(const char *path)
 {
-	int dirfd = open(path, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+	struct open_how how = {
+		.flags = O_RDONLY | O_DIRECTORY | O_CLOEXEC,
+		.resolve = RESOLVE_NO_MAGICLINKS,
+	};
+	int dirfd = sys_openat2(AT_FDCWD, path, &how, sizeof(how));
 	if (dirfd < 0) {
 		ERROR("path %s open failed %m\n", path);
 		return -1;

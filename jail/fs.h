@@ -15,6 +15,7 @@
 
 #include <sys/mount.h>
 #include <linux/mount.h>
+#include <linux/openat2.h>
 #include <libubox/blobmsg.h>
 
 int sys_open_tree(int dfd, const char *path, unsigned int flags);
@@ -22,6 +23,7 @@ int sys_move_mount(int from_dfd, const char *from_path, int to_dfd,
 		   const char *to_path, unsigned int flags);
 int sys_mount_setattr(int dfd, const char *path, unsigned int flags,
 		      struct mount_attr *attr, size_t size);
+int sys_openat2(int dfd, const char *path, struct open_how *how, size_t size);
 int build_userns_fd(struct blob_attr *uidmappings, struct blob_attr *gidmappings);
 
 int add_mount(const char *source, const char *target, const char *filesystemtype,
