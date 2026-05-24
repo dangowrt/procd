@@ -3273,6 +3273,7 @@ enum {
 	OCI_STATE_CREATING,
 	OCI_STATE_CREATED,
 	OCI_STATE_RUNNING,
+	OCI_STATE_PAUSED,
 	OCI_STATE_STOPPED,
 };
 
@@ -3311,6 +3312,9 @@ static int handle_state(struct ubus_context *ctx, struct ubus_object *obj,
 		case OCI_STATE_RUNNING:
 			statusstr = "running";
 			break;
+		case OCI_STATE_PAUSED:
+			statusstr = "paused";
+			break;
 		case OCI_STATE_STOPPED:
 			statusstr = "stopped";
 			break;
@@ -3323,7 +3327,8 @@ static int handle_state(struct ubus_context *ctx, struct ubus_object *obj,
 	blobmsg_add_string(&bb, "id", opts.name);
 	blobmsg_add_string(&bb, "status", statusstr);
 	if (jail_oci_state == OCI_STATE_CREATED ||
-	    jail_oci_state == OCI_STATE_RUNNING)
+	    jail_oci_state == OCI_STATE_RUNNING ||
+	    jail_oci_state == OCI_STATE_PAUSED)
 		blobmsg_add_u32(&bb, "pid", jail_process.pid);
 
 	blobmsg_add_string(&bb, "bundle", opts.ocibundle);
@@ -3368,6 +3373,8 @@ container_handle_kill(struct ubus_context *ctx, struct ubus_object *obj,
 
 	if (jail_oci_state == OCI_STATE_CREATING)
 		return UBUS_STATUS_NOT_FOUND;
+	if (jail_oci_state == OCI_STATE_PAUSED && sig != SIGKILL && sig != 0)
+		return UBUS_STATUS_PERMISSION_DENIED;
 
 	if (all && sig == SIGKILL) {
 		int rc = cgroups_kill_all();
@@ -3386,6 +3393,61 @@ container_handle_kill(struct ubus_context *ctx, struct ubus_object *obj,
 	}
 
 	return UBUS_STATUS_UNKNOWN_ERROR;
+}
+
+static int
+container_handle_pause(struct ubus_context *ctx, struct ubus_object *obj,
+		      struct ubus_request_data *req, const char *method,
+		      struct blob_attr *msg)
+{
+	int rc;
+
+	if (jail_oci_state != OCI_STATE_CREATED &&
+	    jail_oci_state != OCI_STATE_RUNNING)
+		return UBUS_STATUS_INVALID_ARGUMENT;
+
+	rc = cgroups_set_frozen(true);
+	if (rc < 0) {
+		switch (rc) {
+		case -ENODEV:
+		case -ENOENT:
+			return UBUS_STATUS_NOT_SUPPORTED;
+		case -EINVAL:
+			return UBUS_STATUS_INVALID_ARGUMENT;
+		default:
+			return UBUS_STATUS_UNKNOWN_ERROR;
+		}
+	}
+
+	jail_oci_state = OCI_STATE_PAUSED;
+	return UBUS_STATUS_OK;
+}
+
+static int
+container_handle_resume(struct ubus_context *ctx, struct ubus_object *obj,
+		       struct ubus_request_data *req, const char *method,
+		       struct blob_attr *msg)
+{
+	int rc;
+
+	if (jail_oci_state != OCI_STATE_PAUSED)
+		return UBUS_STATUS_INVALID_ARGUMENT;
+
+	rc = cgroups_set_frozen(false);
+	if (rc < 0) {
+		switch (rc) {
+		case -ENODEV:
+		case -ENOENT:
+			return UBUS_STATUS_NOT_SUPPORTED;
+		case -EINVAL:
+			return UBUS_STATUS_INVALID_ARGUMENT;
+		default:
+			return UBUS_STATUS_UNKNOWN_ERROR;
+		}
+	}
+
+	jail_oci_state = OCI_STATE_RUNNING;
+	return UBUS_STATUS_OK;
 }
 
 static int
@@ -4007,6 +4069,8 @@ static struct ubus_method container_methods[] = {
 	UBUS_METHOD_NOARG("start", handle_start),
 	UBUS_METHOD_NOARG("state", handle_state),
 	UBUS_METHOD("kill", container_handle_kill, container_kill_attrs),
+	UBUS_METHOD_NOARG("pause", container_handle_pause),
+	UBUS_METHOD_NOARG("resume", container_handle_resume),
 	UBUS_METHOD_NOARG("update", container_handle_update),
 	UBUS_METHOD("exec", container_handle_exec, container_exec_attrs),
 };

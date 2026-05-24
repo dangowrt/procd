@@ -287,6 +287,8 @@ static int usage(void) {
 	printf("\tenable <conf>\t\t\t\tstart container <conf> on boot\n");
 	printf("\tdisable <conf>\t\t\t\tdon't start container <conf> on boot\n");
 	printf("\tdelete <conf> [--force]\t\t\tdelete <conf>\n");
+	printf("\tpause <conf>\t\t\t\tfreeze every process in container <conf>'s cgroup\n");
+	printf("\tresume <conf>\t\t\t\tthaw a previously paused container <conf>\n");
 	printf("\texec <conf> [--process <file>] [-d] [-p <pid-file>] [-- cmd args]\n");
 	printf("\t\t\t\t\t\trun a command inside running container <conf>\n");
 	printf("\tupdate <conf> --resources <file>\tapply linux.resources from <file> to running container <conf>\n");
@@ -2021,8 +2023,26 @@ next_global:
 		if (optind != verb_argc - 1)
 			goto usage_out;
 		ret = uxc_update(verb_argv[optind], resources_file);
-	} else if (!strcmp(verb, "pause") || !strcmp(verb, "resume") ||
-		   !strcmp(verb, "events") || !strcmp(verb, "checkpoint") ||
+	} else if (!strcmp(verb, "pause") || !strcmp(verb, "resume")) {
+		char *objname;
+		uint32_t id;
+
+		if (verb_argc != 2)
+			goto usage_out;
+		if (asprintf(&objname, "container.%s", verb_argv[1]) == -1) {
+			ret = -ENOMEM;
+			goto runtime_out;
+		}
+		ret = ubus_lookup_id(ctx, objname, &id);
+		free(objname);
+		if (ret) {
+			ret = -ENOENT;
+			goto runtime_out;
+		}
+		ret = ubus_invoke(ctx, id, verb, NULL, NULL, NULL, 3000);
+		if (ret)
+			ret = -EIO;
+	} else if (!strcmp(verb, "events") || !strcmp(verb, "checkpoint") ||
 		   !strcmp(verb, "restore")) {
 		fprintf(stderr, "uxc: '%s' is not supported\n", verb);
 		ret = -ENOTSUP;

@@ -100,7 +100,7 @@ void cgroups_free(void)
 	}
 }
 
-int cgroups_kill_all(void)
+static int cgroups_write_attr(const char *attr, const char *val, size_t vlen)
 {
 	char *ent;
 	int fd, ret = 0;
@@ -109,12 +109,12 @@ int cgroups_kill_all(void)
 	if (!cgroup_path)
 		return -ENODEV;
 
-	len = strlen(cgroup_path) + strlen("/cgroup.kill") + 1;
+	len = strlen(cgroup_path) + 1 + strlen(attr) + 1;
 	ent = malloc(len);
 	if (!ent)
 		return -ENOMEM;
 
-	snprintf(ent, len, "%s/cgroup.kill", cgroup_path);
+	snprintf(ent, len, "%s/%s", cgroup_path, attr);
 	fd = open(ent, O_WRONLY);
 	if (fd < 0) {
 		ret = -errno;
@@ -122,12 +122,22 @@ int cgroups_kill_all(void)
 		return ret;
 	}
 
-	if (write(fd, "1", 1) < 0)
+	if (write(fd, val, vlen) < 0)
 		ret = -errno;
 
 	close(fd);
 	free(ent);
 	return ret;
+}
+
+int cgroups_kill_all(void)
+{
+	return cgroups_write_attr("cgroup.kill", "1", 1);
+}
+
+int cgroups_set_frozen(bool frozen)
+{
+	return cgroups_write_attr("cgroup.freeze", frozen ? "1" : "0", 1);
 }
 
 int cgroups_attach_pid(pid_t pid)

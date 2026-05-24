@@ -21,6 +21,7 @@ int parseOCIlinuxcgroups(struct blob_attr *msg, bool is_update);
 void cgroups_apply(pid_t pid);
 int cgroups_attach_pid(pid_t pid);
 int cgroups_kill_all(void);
+int cgroups_set_frozen(bool frozen);
 void cgroups_free(void);
 void cgroups_prepare(void);
 
