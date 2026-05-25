@@ -102,6 +102,21 @@ ADD_CUSTOM_TARGET(capabilities-names-h DEPENDS capabilities-names.h)
 IF(SECCOMP_SUPPORT)
 ADD_DEFINITIONS(-DSECCOMP_SUPPORT)
 ADD_LIBRARY(preload-seccomp SHARED jail/preload.c)
+TARGET_COMPILE_OPTIONS(preload-seccomp PRIVATE -fvisibility=hidden)
+SET_TARGET_PROPERTIES(preload-seccomp PROPERTIES LINK_FLAGS "-Wl,-Bsymbolic-functions")
+# When NOLIBC_INCLUDE_DIR is set to the kernel tree's tools/include/nolibc
+# directory, libpreload-seccomp.so is built freestanding against nolibc, so
+# it carries no DT_NEEDED entries and pulls neither libc nor libdl into the
+# jail rootfs. Without it, the preload links against the system libc as
+# before. The OpenWrt procd recipe is expected to pass
+# -DNOLIBC_INCLUDE_DIR=$(LINUX_DIR)/tools/include/nolibc to opt in.
+SET(NOLIBC_INCLUDE_DIR "" CACHE PATH "Path to kernel tools/include/nolibc; if set, libpreload-seccomp.so is built freestanding")
+IF(NOLIBC_INCLUDE_DIR)
+	TARGET_INCLUDE_DIRECTORIES(preload-seccomp PRIVATE ${NOLIBC_INCLUDE_DIR})
+	TARGET_COMPILE_OPTIONS(preload-seccomp PRIVATE
+		-nostdlib -ffreestanding -fno-builtin -include nolibc.h)
+	SET_TARGET_PROPERTIES(preload-seccomp PROPERTIES LINK_FLAGS "-nostdlib -Wl,-Bsymbolic-functions")
+ENDIF()
 INSTALL(TARGETS preload-seccomp
 	LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
 )
