@@ -18,6 +18,7 @@
 struct sock_fprog *parseOCIlinuxseccomp(struct blob_attr *msg);
 int applyOCIlinuxseccomp(struct sock_fprog *prog, const char *container_id,
 			 const char *bundle_path);
+int seccomp_oci_compile_to_memfd(const char *json_path);
 
 #ifndef SECCOMP_SUPPORT
 struct sock_fprog *parseOCIlinuxseccomp(struct blob_attr *msg) {
@@ -27,6 +28,10 @@ struct sock_fprog *parseOCIlinuxseccomp(struct blob_attr *msg) {
 int applyOCIlinuxseccomp(struct sock_fprog *prog, const char *container_id,
 			 const char *bundle_path) {
 	return ENOTSUP;
+}
+
+int seccomp_oci_compile_to_memfd(const char *json_path) {
+	return -1;
 }
 #endif
 

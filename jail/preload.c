@@ -1,5 +1,8 @@
 /*
- * Copyright (C) 2015 John Crispin <blogic@openwrt.org>
+ * Install a pre-compiled seccomp BPF filter passed in from ujail via a
+ * sealed memfd identified by the SECCOMP_BPF_FD environment variable.
+ *
+ * Copyright (C) 2026 Daniel Golle <daniel@makrotopia.org>
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU Lesser General Public License version 2.1
@@ -12,85 +15,67 @@
  */
 
 #define _GNU_SOURCE
-#include <sys/types.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <stdio.h>
 #include <stdlib.h>
-#include <unistd.h>
 #include <string.h>
-#include <dlfcn.h>
+#include <unistd.h>
+#include <sys/mman.h>
+#include <sys/prctl.h>
+#include <sys/stat.h>
+#include <sys/syscall.h>
+#include <linux/filter.h>
+#include <linux/seccomp.h>
 
-#include "log.h"
-#include "seccomp.h"
-#include "../preload.h"
-
-static main_t __main__;
-int debug;
-
-static int __preload_main__(int argc, char **argv, char **envp)
+static void preload_die(const char *msg)
 {
-	char *env_file = getenv("SECCOMP_FILE");
-	char *env_debug = getenv("SECCOMP_DEBUG");
+	int e = errno;
 
-	if (!env_file || !env_file[0]) {
-		ERROR("SECCOMP_FILE not specified\n");
-		return -1;
-	}
-
-	if (env_debug)
-		debug = atoi(env_debug);
-	else
-		debug = 0;
-
-	if (install_syscall_filter(*argv, env_file))
-		return -1;
-
-	unsetenv("LD_PRELOAD");
-	unsetenv("SECCOMP_DEBUG");
-	unsetenv("SECCOMP_FILE");
-
-	return (*__main__)(argc, argv, envp);
+	fprintf(stderr, "preload-seccomp: %s: %s\n", msg,
+		e ? strerror(e) : "");
+	_exit(127);
 }
 
-int __libc_start_main(main_t main,
-			int argc,
-			char **argv,
-			ElfW(auxv_t) *auxvec,
-			__typeof (main) init,
-			void (*fini) (void),
-			void (*rtld_fini) (void),
-			void *stack_end)
+__attribute__((constructor))
+static void preload_seccomp_install(void)
 {
-	start_main_t __start_main__;
+	const char *fd_env = getenv("SECCOMP_BPF_FD");
+	struct sock_fprog prog;
+	struct sock_filter *filter;
+	struct stat st;
+	char *end;
+	long fd;
 
-	__start_main__ = dlsym(RTLD_NEXT, "__libc_start_main");
-	if (!__start_main__) {
-		INFO("failed to find __libc_start_main %s\n", dlerror());
-		return -1;
-	}
-
-	__main__ = main;
-
-	return (*__start_main__)(__preload_main__, argc, argv, auxvec,
-		init, fini, rtld_fini, stack_end);
-}
-
-void __uClibc_main(main_t main,
-			int argc,
-			char **argv,
-			void (*app_init)(void),
-			void (*app_fini)(void),
-			void (*rtld_fini)(void),
-			void *stack_end attribute_unused)
-{
-	uClibc_main __start_main__;
-
-	__start_main__ = dlsym(RTLD_NEXT, "__uClibc_main");
-	if (!__start_main__) {
-		INFO("failed to find __uClibc_main %s\n", dlerror());
+	if (!fd_env || !fd_env[0])
 		return;
-	}
 
-	__main__ = main;
+	errno = 0;
+	fd = strtol(fd_env, &end, 10);
+	if (errno || *end || fd < 0 || fd > 0x7fffffff)
+		preload_die("malformed SECCOMP_BPF_FD");
 
-	return (*__start_main__)(__preload_main__, argc, argv,
-		app_init, app_fini, rtld_fini, stack_end);
+	unsetenv("SECCOMP_BPF_FD");
+	unsetenv("LD_PRELOAD");
+
+	if (fstat((int)fd, &st) < 0)
+		preload_die("fstat");
+
+	if (st.st_size == 0 || (size_t)st.st_size % sizeof(*filter))
+		preload_die("bad memfd size");
+
+	filter = mmap(NULL, st.st_size, PROT_READ, MAP_PRIVATE, (int)fd, 0);
+	if (filter == MAP_FAILED)
+		preload_die("mmap");
+
+	close((int)fd);
+
+	prog.len = st.st_size / sizeof(*filter);
+	prog.filter = filter;
+
+	if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0))
+		preload_die("PR_SET_NO_NEW_PRIVS");
+
+	if (syscall(SYS_seccomp, SECCOMP_SET_MODE_FILTER, 0, &prog))
+		preload_die("seccomp(SET_MODE_FILTER)");
 }

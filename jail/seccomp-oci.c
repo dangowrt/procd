@@ -22,6 +22,7 @@
  */
 #define _GNU_SOURCE 1
 #include <assert.h>
+#include <fcntl.h>
 #include <stddef.h>
 #include <stdlib.h>
 #include <string.h>
@@ -29,6 +30,7 @@
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <errno.h>
+#include <linux/memfd.h>
 
 #include <libubox/utils.h>
 #include <libubox/blobmsg.h>
@@ -700,4 +702,100 @@ errout:
 	free(prog->filter);
 	free(prog);
 	return errno;
+}
+
+int seccomp_oci_compile_to_memfd(const char *json_path)
+{
+	struct blob_buf b = { 0 };
+	struct sock_fprog *prog;
+	size_t total;
+	ssize_t off;
+	int mfd, rc;
+	unsigned long saved_flags;
+	char *saved_listener_path;
+	char *saved_listener_metadata;
+	bool saved_uses_notify;
+
+	saved_flags = seccomp_filter_flags;
+	saved_listener_path = seccomp_listener_path;
+	saved_listener_metadata = seccomp_listener_metadata;
+	saved_uses_notify = seccomp_uses_notify;
+	seccomp_filter_flags = 0;
+	seccomp_listener_path = NULL;
+	seccomp_listener_metadata = NULL;
+	seccomp_uses_notify = false;
+
+	blob_buf_init(&b, 0);
+	if (!blobmsg_add_json_from_file(&b, json_path)) {
+		ERROR("seccomp: failed to load %s\n", json_path);
+		blob_buf_free(&b);
+		goto restore_fail;
+	}
+
+	prog = parseOCIlinuxseccomp(b.head);
+	blob_buf_free(&b);
+	if (!prog) {
+		ERROR("seccomp: failed to parse %s\n", json_path);
+		goto restore_fail;
+	}
+
+	if (seccomp_uses_notify || seccomp_filter_flags) {
+		ERROR("seccomp -S: NOTIFY/flags not supported via memfd handoff; use linux.seccomp in the bundle\n");
+		free(prog->filter);
+		free(prog);
+		free(seccomp_listener_path);
+		free(seccomp_listener_metadata);
+		goto restore_fail;
+	}
+
+	mfd = syscall(SYS_memfd_create, "seccomp-bpf",
+		      MFD_ALLOW_SEALING);
+	if (mfd < 0) {
+		ERROR("seccomp: memfd_create: %m\n");
+		goto errout;
+	}
+
+	total = (size_t)prog->len * sizeof(*prog->filter);
+	for (off = 0; (size_t)off < total; ) {
+		ssize_t n = write(mfd, (char *)prog->filter + off, total - off);
+
+		if (n < 0) {
+			if (errno == EINTR)
+				continue;
+			ERROR("seccomp: write memfd: %m\n");
+			close(mfd);
+			goto errout;
+		}
+		off += n;
+	}
+
+	rc = fcntl(mfd, F_ADD_SEALS,
+		   F_SEAL_WRITE | F_SEAL_GROW | F_SEAL_SHRINK);
+	if (rc < 0) {
+		ERROR("seccomp: F_ADD_SEALS: %m\n");
+		close(mfd);
+		goto errout;
+	}
+
+	free(prog->filter);
+	free(prog);
+	free(seccomp_listener_path);
+	free(seccomp_listener_metadata);
+	seccomp_filter_flags = saved_flags;
+	seccomp_listener_path = saved_listener_path;
+	seccomp_listener_metadata = saved_listener_metadata;
+	seccomp_uses_notify = saved_uses_notify;
+	return mfd;
+
+errout:
+	free(prog->filter);
+	free(prog);
+	free(seccomp_listener_path);
+	free(seccomp_listener_metadata);
+restore_fail:
+	seccomp_filter_flags = saved_flags;
+	seccomp_listener_path = saved_listener_path;
+	seccomp_listener_metadata = saved_listener_metadata;
+	seccomp_uses_notify = saved_uses_notify;
+	return -1;
 }

@@ -1149,6 +1149,7 @@ static int apply_rlimits(void)
 }
 
 static int preload_memfd_fd = -1;
+static int seccomp_bpf_memfd_fd = -1;
 
 static int preload_load_deps(void)
 {
@@ -1257,8 +1258,7 @@ static char** build_envp(const char *seccomp, char **ocienvp)
 {
 	static char *envp[MAX_ENVP];
 	static char preload_var[PATH_MAX];
-	static char seccomp_var[PATH_MAX];
-	static char seccomp_debug_var[20];
+	static char seccomp_bpf_var[32];
 	static char debug_var[] = "LD_DEBUG=all";
 	static char container_var[] = "container=ujail";
 	const char *preload_lib = find_lib("libpreload-seccomp.so");
@@ -1271,10 +1271,12 @@ static char** build_envp(const char *seccomp, char **ocienvp)
 		return NULL;
 	}
 	if (seccomp) {
-		snprintf(seccomp_var, sizeof(seccomp_var), "SECCOMP_FILE=%s", seccomp);
-		envp[count++] = seccomp_var;
-		snprintf(seccomp_debug_var, sizeof(seccomp_debug_var), "SECCOMP_DEBUG=%2d", debug);
-		envp[count++] = seccomp_debug_var;
+		seccomp_bpf_memfd_fd = seccomp_oci_compile_to_memfd(seccomp);
+		if (seccomp_bpf_memfd_fd < 0)
+			return NULL;
+		snprintf(seccomp_bpf_var, sizeof(seccomp_bpf_var),
+			 "SECCOMP_BPF_FD=%d", seccomp_bpf_memfd_fd);
+		envp[count++] = seccomp_bpf_var;
 		preload_memfd_fd = preload_to_memfd(preload_lib);
 		if (preload_memfd_fd < 0)
 			return NULL;
@@ -2123,9 +2125,11 @@ static void post_start_hook(void)
 	uloop_end();
 	free_opts(false);
 	syscall(SYS_close_range, 3, ~0U, CLOSE_RANGE_CLOEXEC);
-	/* keep the sealed preload memfd open across execve so ld.so can read it */
+	/* keep the sealed memfds open across execve so the workload can read them */
 	if (preload_memfd_fd >= 0)
 		fcntl(preload_memfd_fd, F_SETFD, 0);
+	if (seccomp_bpf_memfd_fd >= 0)
+		fcntl(seccomp_bpf_memfd_fd, F_SETFD, 0);
 	INFO("exec-ing %s\n", *opts.jail_argv);
 	if (opts.envp) /* respect PATH if potentially set in ENV */
 		execvpe(*opts.jail_argv, opts.jail_argv, envp);

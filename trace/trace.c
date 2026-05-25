@@ -43,6 +43,7 @@
 #include <libubox/blobmsg.h>
 #include <libubox/blobmsg_json.h>
 
+#include "../jail/seccomp-oci.h"
 #include "../syscall-names.h"
 
 #define _offsetof(a, b) __builtin_offsetof(a,b)
@@ -81,7 +82,7 @@ static struct tracee tracer;
 static int syscall_count[SYSCALL_COUNT];
 static int violation_count;
 static struct blob_buf b;
-static int debug;
+int debug;
 char *json = NULL;
 int ptrace_restart;
 
@@ -337,6 +338,7 @@ int main(int argc, char **argv, char **envp)
 		const char *old_preload = getenv("LD_PRELOAD");
 		int newenv = 0;
 		int envc = 0;
+		int bpf_fd;
 		int ret;
 
 		memcpy(_argv, argv, argc * sizeof(char *));
@@ -353,12 +355,24 @@ int main(int argc, char **argv, char **envp)
 		case SECCOMP_TRACE:
 			preload = "/lib/libpreload-seccomp.so";
 			newenv = 2;
-			if (asprintf(&_envp[1], "SECCOMP_FILE=%s", json ? json : "") < 0)
-				ULOG_ERR("failed to allocate SECCOMP_FILE env: %m\n");
+
+			if (!json || !json[0]) {
+				ULOG_ERR("seccomp-trace requires -f or SECCOMP_FILE\n");
+				return -1;
+			}
+
+			bpf_fd = seccomp_oci_compile_to_memfd(json);
+			if (bpf_fd < 0) {
+				ULOG_ERR("failed to compile seccomp filter from %s\n", json);
+				return -1;
+			}
+			if (asprintf(&_envp[1], "SECCOMP_BPF_FD=%d", bpf_fd) < 0)
+				ULOG_ERR("failed to allocate SECCOMP_BPF_FD env: %m\n");
 
 			kill(getpid(), SIGSTOP);
 			break;
 		}
+
 		if (asprintf(&_envp[0], "LD_PRELOAD=%s%s%s", preload,
 			     old_preload ? ":" : "",
 			      old_preload ? old_preload : "") < 0)
