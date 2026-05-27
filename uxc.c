@@ -263,6 +263,106 @@ static struct blob_attr *blockinfo;
 static struct blob_attr *fstabinfo;
 static struct ubus_context *ctx;
 
+/* ujail's free_and_exit always fires instance.stopped, so the wait terminates
+ * via an event in every path except an ungraceful death (SIGKILL/OOM) that
+ * never reaches free_and_exit — the timeout catches that. */
+#define UXC_WAIT_UNSET		0
+#define UXC_WAIT_OK		1	/* success_event fired */
+#define UXC_WAIT_STOPPED	2	/* instance.stopped fired first */
+
+struct uxc_wait_state {
+	const char *service;
+	const char *instance;
+	const char *success_event;
+	int result;
+};
+
+static struct uxc_wait_state *active_wait;
+
+enum {
+	UXC_WAIT_SERVICE,
+	UXC_WAIT_INSTANCE,
+	__UXC_WAIT_INST_MAX,
+};
+
+static const struct blobmsg_policy uxc_wait_inst_policy[__UXC_WAIT_INST_MAX] = {
+	[UXC_WAIT_SERVICE]  = { "service",  BLOBMSG_TYPE_STRING },
+	[UXC_WAIT_INSTANCE] = { "instance", BLOBMSG_TYPE_STRING },
+};
+
+static void uxc_wait_timeout_cb(struct uloop_timeout *t)
+{
+	uloop_end();
+}
+
+static void uxc_wait_event_cb(struct ubus_context *uctx,
+			      struct ubus_event_handler *ev,
+			      const char *type, struct blob_attr *msg)
+{
+	struct blob_attr *tb[__UXC_WAIT_INST_MAX];
+	struct uxc_wait_state *w = active_wait;
+	int result;
+
+	if (!w)
+		return;
+	blobmsg_parse(uxc_wait_inst_policy, __UXC_WAIT_INST_MAX, tb,
+		      blobmsg_data(msg), blobmsg_data_len(msg));
+	if (!tb[UXC_WAIT_SERVICE] || !tb[UXC_WAIT_INSTANCE])
+		return;
+	if (w->service && strcmp(blobmsg_get_string(tb[UXC_WAIT_SERVICE]), w->service))
+		return;
+	if (w->instance && strcmp(blobmsg_get_string(tb[UXC_WAIT_INSTANCE]), w->instance))
+		return;
+
+	if (w->success_event && !strcmp(type, w->success_event))
+		result = UXC_WAIT_OK;
+	else if (!strcmp(type, "instance.stopped"))
+		result = UXC_WAIT_STOPPED;
+	else
+		return;
+
+	w->result = result;
+	uloop_end();
+}
+
+static struct ubus_event_handler uxc_wait_ev;
+static bool uxc_wait_armed;
+
+static int uxc_wait_arm(struct uxc_wait_state *w)
+{
+	uxc_wait_ev.cb = uxc_wait_event_cb;
+	if (ubus_register_event_handler(ctx, &uxc_wait_ev, "instance.*"))
+		return -EIO;
+	uxc_wait_armed = true;
+	active_wait = w;
+	return 0;
+}
+
+static int uxc_wait_run(struct uxc_wait_state *w, unsigned int timeout_ms)
+{
+	struct uloop_timeout t = { .cb = uxc_wait_timeout_cb };
+
+	uloop_init();
+	ubus_add_uloop(ctx);
+	uloop_timeout_set(&t, timeout_ms);
+	if (w->result == UXC_WAIT_UNSET)
+		uloop_run();
+	uloop_timeout_cancel(&t);
+	uloop_done();
+	if (w->result == UXC_WAIT_UNSET)
+		return -ETIMEDOUT;
+	return 0;
+}
+
+static void uxc_wait_disarm(void)
+{
+	active_wait = NULL;
+	if (uxc_wait_armed) {
+		ubus_unregister_event_handler(ctx, &uxc_wait_ev);
+		uxc_wait_armed = false;
+	}
+}
+
 static int usage(void) {
 	printf("syntax: uxc [global options] <command> [parameters ...]\n");
 	printf("global options:\n");
@@ -970,6 +1070,7 @@ static int uxc_create(char *name, bool immediately, const char *console_socket,
 	uint32_t id;
 	struct settings *usettings = NULL;
 	char *path = NULL, *jailname = NULL, *pidfile = NULL, *tmprwsize = NULL, *writepath = NULL;
+	struct uxc_wait_state wait_state;
 
 	void *in, *ins, *j;
 	bool found = false;
@@ -1054,20 +1155,44 @@ static int uxc_create(char *name, bool immediately, const char *console_socket,
 		free(tmp);
 	}
 
-	if (ubus_lookup_id(ctx, "container", &id) ||
-		ubus_invoke(ctx, id, "add", req.head, NULL, NULL, 3000)) {
+	if (ubus_lookup_id(ctx, "container", &id)) {
 		blob_buf_free(&req);
-		ret = -EIO;
+		return -EIO;
 	}
+
+	memset(&wait_state, 0, sizeof(wait_state));
+	wait_state.service = name;
+	wait_state.instance = name;
+	wait_state.success_event = "instance.ready";
+
+	if (uxc_wait_arm(&wait_state))
+		fprintf(stderr, "uxc: warning: cannot arm instance.* watcher\n");
+
+	if (ubus_invoke(ctx, id, "add", req.head, NULL, NULL, 3000)) {
+		blob_buf_free(&req);
+		uxc_wait_disarm();
+		return -EIO;
+	}
+
+	uxc_wait_run(&wait_state, 30000);
+	uxc_wait_disarm();
+	if (wait_state.result == UXC_WAIT_STOPPED) {
+		fprintf(stderr, "uxc: create %s failed: container exited before ready\n", name);
+		return -EIO;
+	}
+	if (wait_state.result == UXC_WAIT_UNSET)
+		fprintf(stderr, "uxc: warning: timed out waiting for instance.ready\n");
 
 	return ret;
 }
 
 static int uxc_start(const char *name, bool console)
 {
+	struct uxc_wait_state wait_state;
 	char *objname;
 	unsigned int id;
 	pid_t pid;
+	int ret;
 
 	if (console) {
 		pid = fork();
@@ -1078,11 +1203,37 @@ static int uxc_start(const char *name, bool console)
 	if (asprintf(&objname, "container.%s", name) == -1)
 		return -ENOMEM;
 
-	if (ubus_lookup_id(ctx, objname, &id))
+	if (ubus_lookup_id(ctx, objname, &id)) {
+		free(objname);
 		return -ENOENT;
-
+	}
 	free(objname);
-	return ubus_invoke(ctx, id, "start", NULL, NULL, NULL, 3000);
+
+	memset(&wait_state, 0, sizeof(wait_state));
+	wait_state.service = name;
+	wait_state.instance = name;
+	wait_state.success_event = "instance.running";
+
+	if (uxc_wait_arm(&wait_state))
+		fprintf(stderr, "uxc: warning: cannot arm instance.* watcher\n");
+
+	ret = ubus_invoke(ctx, id, "start", NULL, NULL, NULL, 3000);
+	if (ret) {
+		uxc_wait_disarm();
+		return ret;
+	}
+
+	uxc_wait_run(&wait_state, 30000);
+	uxc_wait_disarm();
+	if (wait_state.result == UXC_WAIT_STOPPED) {
+		fprintf(stderr, "uxc: start %s failed: container exited before running\n", name);
+		return -EIO;
+	}
+	if (wait_state.result == UXC_WAIT_UNSET) {
+		fprintf(stderr, "uxc: warning: timed out waiting for instance.running\n");
+		return -ETIMEDOUT;
+	}
+	return 0;
 }
 
 struct uxc_exec_reply {
@@ -1605,6 +1756,8 @@ static int uxc_delete(char *name, bool force)
 	const char *cfname = NULL;
 	const char *sfname = NULL;
 	struct stat sb;
+	struct uxc_wait_state wait_state;
+	char *objname = NULL;
 
 	blobmsg_for_each_attr(cur, blob_data(conf.head), rem) {
 		blobmsg_parse(conf_policy, __CONF_MAX, tb, blobmsg_data(cur), blobmsg_len(cur));
@@ -1636,6 +1789,9 @@ static int uxc_delete(char *name, bool force)
 	}
 
 	if (rsstate) {
+		uint32_t cont_id;
+		bool have_cont_obj;
+
 		ret = ubus_lookup_id(ctx, "container", &id);
 		if (ret)
 			goto errout;
@@ -1644,10 +1800,39 @@ static int uxc_delete(char *name, bool force)
 		blobmsg_add_string(&req, "name", rsstate->container_name);
 		blobmsg_add_string(&req, "instance", rsstate->instance_name);
 
+		if (asprintf(&objname, "container.%s", rsstate->container_name) == -1) {
+			blob_buf_free(&req);
+			ret = -ENOMEM;
+			goto errout;
+		}
+
+		have_cont_obj = (ubus_lookup_id(ctx, objname, &cont_id) == 0);
+		free(objname);
+		objname = NULL;
+
+		if (have_cont_obj) {
+			memset(&wait_state, 0, sizeof(wait_state));
+			wait_state.service = rsstate->container_name;
+			wait_state.instance = rsstate->instance_name;
+			/* No success_event - any instance.stopped for this
+			 * container is what we want. */
+			if (uxc_wait_arm(&wait_state))
+				fprintf(stderr, "uxc: warning: cannot arm instance.* watcher\n");
+		}
+
 		if (ubus_invoke(ctx, id, "delete", req.head, NULL, NULL, 3000)) {
 			blob_buf_free(&req);
+			if (have_cont_obj)
+				uxc_wait_disarm();
 			ret = -EIO;
 			goto errout;
+		}
+
+		if (have_cont_obj) {
+			if (uxc_wait_run(&wait_state, 30000) == -ETIMEDOUT)
+				fprintf(stderr, "uxc: warning: timed out waiting for container.%s removal\n",
+					rsstate->container_name);
+			uxc_wait_disarm();
 		}
 	}
 
