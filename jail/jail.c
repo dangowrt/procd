@@ -204,6 +204,12 @@ static struct {
 } opts;
 
 static struct blob_buf ocibuf;
+static struct blob_buf notify_buf;
+static int exec_ack[2] = { -1, -1 };
+static void exec_ack_cb(struct uloop_fd *fd, unsigned int events);
+static struct uloop_fd exec_ack_uloop = {
+	.cb = exec_ack_cb,
+};
 
 extern int pivot_root(const char *new_root, const char *put_old);
 
@@ -962,8 +968,14 @@ static int build_jail_fs(void)
 }
 
 static bool exit_from_child;
+static void emit_instance_event(const char *event);
 static void free_and_exit(int ret)
 {
+	/* exit_from_child: cloned init unwinding its own setup error. ubus and
+	 * cgroups belong to the parent; only the parent emits and frees them. */
+	if (!exit_from_child && opts.ocibundle && parent_ctx && opts.name)
+		emit_instance_event("instance.stopped");
+
 	if (!exit_from_child && opts.ocibundle)
 		cgroups_free();
 
@@ -3497,7 +3509,7 @@ enum {
 	OCI_STATE_STOPPED,
 };
 
-static int jail_oci_state = OCI_STATE_CREATED;
+static int jail_oci_state = OCI_STATE_CREATING;
 static void pipe_send_start_container(struct uloop_timeout *t);
 static struct uloop_timeout start_container_timeout = {
 	.cb = pipe_send_start_container,
@@ -4785,12 +4797,8 @@ int main(int argc, char **argv)
 	uloop_run();
 
 errout:
-	if (opts.ocibundle)
-		cgroups_free();
-
-	free_opts(true);
-
-	return ret;
+	free_and_exit(ret);
+	return ret;	/* unreachable, silences compiler */
 }
 
 static void post_prestart(void)
@@ -4813,6 +4821,9 @@ static void post_main(struct uloop_timeout *t)
 		prctl(PR_SET_NAME, opts.name, NULL, NULL, NULL);
 
 	if (pipe(&pipes[0]) < 0 || pipe(&pipes[2]) < 0)
+		free_and_exit(-1);
+
+	if (pipe2(exec_ack, O_CLOEXEC) < 0)
 		free_and_exit(-1);
 
 	if (opts.ocibundle)
@@ -4966,6 +4977,14 @@ static void post_main(struct uloop_timeout *t)
 			close(opts.setns.cgroup);
 		close(pipes[1]);
 		close(pipes[2]);
+		if (exec_ack[1] >= 0) {
+			close(exec_ack[1]);
+			exec_ack[1] = -1;
+		}
+		if (exec_ack[0] >= 0) {
+			exec_ack_uloop.fd = exec_ack[0];
+			uloop_fd_add(&exec_ack_uloop, ULOOP_READ);
+		}
 		if (read(pipes[0], sig_buf, 1) < 1) {
 			ERROR("can't read from child\n");
 			free_and_exit(-1);
@@ -5023,6 +5042,39 @@ static void post_main(struct uloop_timeout *t)
 	run_hooks(opts.hooks.prestart, post_prestart);
 }
 
+static void emit_instance_event(const char *event)
+{
+	if (!opts.ocibundle || !opts.name || !parent_ctx)
+		return;
+	blob_buf_init(&notify_buf, 0);
+	blobmsg_add_string(&notify_buf, "service", opts.name);
+	blobmsg_add_string(&notify_buf, "instance", opts.name);
+	ubus_send_event(parent_ctx, event, notify_buf.head);
+}
+
+static void exec_ack_cb(struct uloop_fd *fd, unsigned int events)
+{
+	char buf[8];
+	ssize_t n;
+
+	n = read(fd->fd, buf, sizeof(buf));
+	if (n < 0 && errno == EINTR)
+		return;
+
+	uloop_fd_delete(fd);
+	close(fd->fd);
+	exec_ack[0] = -1;
+
+	if (n != 0) {
+		/* EOF (n==0) means the kernel closed init's CLOEXEC end on a
+		 * successful execve. Anything else is unexpected. */
+		ERROR("container.start: exec_ack read=%zd errno=%m\n", n);
+		return;
+	}
+
+	emit_instance_event("instance.running");
+}
+
 static void post_poststart(void);
 static void post_create_runtime(void)
 {
@@ -5040,6 +5092,8 @@ static void post_create_runtime(void)
 	}
 
 	jail_oci_state = OCI_STATE_CREATED;
+	emit_instance_event("instance.ready");
+
 	if (opts.ocibundle && !opts.immediately)
 		uloop_run(); /* wait for 'start' command via ubus */
 	else
@@ -5094,9 +5148,5 @@ static void post_poststop(void)
 		close(jail_process_pidfd);
 		jail_process_pidfd = -1;
 	}
-	free_opts(true);
-	if (parent_ctx)
-		ubus_free(parent_ctx);
-
-	exit(jail_return_code);
+	free_and_exit(jail_return_code);
 }
