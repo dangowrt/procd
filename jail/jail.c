@@ -1468,8 +1468,26 @@ static void signals_init(void)
 
 		if (!sigismember(&sigmask, i))
 			continue;
-		if ((i == SIGCHLD) || (i == SIGPIPE) || (i == SIGSEGV) || (i == SIGSTOP) || (i == SIGKILL))
+		/* skip un-catchable, ignored-by-default, and synchronous fault
+		 * signals; the latter must not be re-entered through a forwarding
+		 * handler because the kernel would just restart the faulting
+		 * instruction and spin forever. */
+		switch (i) {
+		case SIGCHLD:
+		case SIGPIPE:
+		case SIGKILL:
+		case SIGSTOP:
+		case SIGSEGV:
+		case SIGBUS:
+		case SIGFPE:
+		case SIGILL:
+		case SIGSYS:
+		case SIGABRT:
+		case SIGTRAP:
 			continue;
+		default:
+			break;
+		}
 
 		s.sa_handler = jail_handle_signal;
 		sigaction(i, &s, NULL);
