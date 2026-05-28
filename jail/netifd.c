@@ -439,12 +439,53 @@ static void watch_ubus_service(void)
 
 static struct uloop_timeout ubus_start_timeout = { .cb = run_ubusd, };
 
-int jail_network_start(struct ubus_context *new_ctx, char *new_jail_name, pid_t new_ns_pid)
+/* Arm the netifd side: inotify-watch the ubus socket directory so we can
+ * spawn netifd as soon as ubusd creates its socket, subscribe to host
+ * service.config.change events so /etc/config/network edits get propagated,
+ * and tell host netifd that this jail's netns is now under jail-side
+ * management. Pure ubusd flows skip all of this. */
+static int jail_netifd_arm(void)
 {
-	ubus_pw = getpwnam("ubus");
-	int ret = 0;
 	int netns_fd;
 
+	fd_inotify_read.fd = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
+	fd_inotify_read.cb = inotify_read_handler;
+	if (fd_inotify_read.fd == -1) {
+		ERROR("failed to initialize inotify handler\n");
+		return EIO;
+	}
+	uloop_fd_add(&fd_inotify_read, ULOOP_READ);
+
+	inotify_buffer = calloc(1, INOTIFY_SZ);
+	if (!inotify_buffer)
+		goto err_close;
+
+	if (inotify_add_watch(fd_inotify_read.fd, ubus_sock_dir, IN_CREATE) == -1) {
+		ERROR("failed to add inotify watch on %s\n", ubus_sock_dir);
+		free(inotify_buffer);
+		goto err_close;
+	}
+
+	watch_ubus_service();
+
+	netns_fd = ns_open_pid("net", ns_pid);
+	if (netns_fd < 0)
+		return ESRCH;
+
+	netns_updown(host_ubus_ctx, jail_name, true, netns_fd);
+	close(netns_fd);
+	return 0;
+
+err_close:
+	close(fd_inotify_read.fd);
+	return EIO;
+}
+
+int jail_network_start(struct ubus_context *new_ctx, char *new_jail_name, pid_t new_ns_pid, bool start_netifd)
+{
+	int ret;
+
+	ubus_pw = getpwnam("ubus");
 	host_ubus_ctx = new_ctx;
 	ns_pid = new_ns_pid;
 	jail_name = new_jail_name;
@@ -460,54 +501,29 @@ int jail_network_start(struct ubus_context *new_ctx, char *new_jail_name, pid_t 
 	}
 
 	mkdir_p(ubus_sock_dir, 0755);
-	if (ubus_pw) {
-		ret = chown(ubus_sock_dir, ubus_pw->pw_uid, ubus_pw->pw_gid);
-		if (ret) {
-			ret = errno;
-			goto errout;
-		}
-	}
-
-	fd_inotify_read.fd = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
-	fd_inotify_read.cb = inotify_read_handler;
-	if (fd_inotify_read.fd == -1) {
-		ERROR("failed to initialize inotify handler\n");
-		ret = EIO;
+	if (ubus_pw && chown(ubus_sock_dir, ubus_pw->pw_uid, ubus_pw->pw_gid)) {
+		ret = errno;
 		goto errout;
 	}
-	uloop_fd_add(&fd_inotify_read, ULOOP_READ);
 
-	inotify_buffer = calloc(1, INOTIFY_SZ);
-	if (!inotify_buffer) {
-		ret = ENOMEM;
-		goto errout_inotify;
+	if (!start_netifd) {
+		/* ubus-only: spawn ubusd synchronously and return. The netifd
+		 * branch needs uloop because run_netifd is driven by inotify
+		 * on the ubus socket being created; without that branch nobody
+		 * ever calls uloop_end and we'd hang the parent forever. */
+		run_ubusd(NULL);
+		return 0;
 	}
 
-	if (inotify_add_watch(fd_inotify_read.fd, ubus_sock_dir, IN_CREATE) == -1) {
-		ERROR("failed to add inotify watch on %s\n", ubus_sock_dir);
-		free(inotify_buffer);
-		ret = EIO;
-		goto errout_inotify;
-	}
+	ret = jail_netifd_arm();
+	if (ret)
+		goto errout;
 
-	watch_ubus_service();
-
-	netns_fd = ns_open_pid("net", ns_pid);
-	if (netns_fd < 0) {
-		ret = ESRCH;
-		goto errout_inotify;
-	}
-
-	netns_updown(host_ubus_ctx, jail_name, true, netns_fd);
-
-	close(netns_fd);
 	uloop_timeout_add(&ubus_start_timeout);
 	uloop_run();
 
 	return 0;
 
-errout_inotify:
-	close(fd_inotify_read.fd);
 errout:
 	free(ubus_sock_path);
 errout_path:
@@ -531,6 +547,10 @@ static int jail_delete_instance(const char *instance)
 	return ubus_invoke(host_ubus_ctx, id, "delete", req.head, NULL, NULL, 3000);
 }
 
+/* Caller MUST already have setns'd into the jail netns: jail_ubus_ctx talks
+ * to the in-jail netifd, and netns_updown(false) tells it to bring its
+ * interfaces back down through that netns. From any other context the netns
+ * arithmetic is wrong; use jail_network_teardown() instead. */
 int jail_network_stop(void)
 {
 	int host_netns = open("/proc/self/ns/net", O_RDONLY);
@@ -541,7 +561,20 @@ int jail_network_stop(void)
 	netns_updown(jail_ubus_ctx, NULL, false, host_netns);
 
 	close(host_netns);
-	ubus_free(jail_ubus_ctx);
+
+	return jail_network_teardown();
+}
+
+/* Error-path teardown: drops procd's tracking of the per-jail ubus / netifd
+ * instances and frees the bookkeeping. Safe to call from any netns because
+ * it does not touch the in-jail netifd's view of the world. Idempotent so
+ * callers don't need to guard double invocation across error paths. */
+int jail_network_teardown(void)
+{
+	if (jail_ubus_ctx) {
+		ubus_free(jail_ubus_ctx);
+		jail_ubus_ctx = NULL;
+	}
 
 	jail_delete_instance("netifd");
 	jail_delete_instance("ubus");
@@ -550,11 +583,18 @@ int jail_network_stop(void)
 		unlink(uci_config_network);
 		rmdir(dirname(uci_config_network));
 		free(uci_config_network);
+		uci_config_network = NULL;
 	}
 
-	free(ubus_sock_path);
-	rmdir(ubus_sock_dir);
-	free(ubus_sock_dir);
+	if (ubus_sock_path) {
+		free(ubus_sock_path);
+		ubus_sock_path = NULL;
+	}
+	if (ubus_sock_dir) {
+		rmdir(ubus_sock_dir);
+		free(ubus_sock_dir);
+		ubus_sock_dir = NULL;
+	}
 
 	return 0;
 }

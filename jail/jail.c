@@ -201,6 +201,9 @@ static struct {
 	} ioprio;
 	unsigned long mdwe_flags;
 	struct landlock_config landlock;
+	bool private_ubus;
+	bool private_netifd;
+	bool jail_network_started;
 } opts;
 
 static struct blob_buf ocibuf;
@@ -944,8 +947,7 @@ static int build_jail_fs(void)
 	if (opts.console)
 		create_dev_console(jail_root);
 
-	/* make sure /etc/resolv.conf exists if in new network namespace */
-	if (opts.namespace & CLONE_NEWNET) {
+	if ((opts.namespace & CLONE_NEWNET) && opts.private_netifd) {
 		char jailetc[PATH_MAX], jaillink[PATH_MAX];
 
 		snprintf(jailetc, PATH_MAX, "%s/etc", jail_root);
@@ -975,6 +977,14 @@ static void free_and_exit(int ret)
 	 * cgroups belong to the parent; only the parent emits and frees them. */
 	if (!exit_from_child && opts.ocibundle && parent_ctx && opts.name)
 		emit_instance_event("instance.stopped");
+
+	/* error paths bypass poststop() so reap the per-jail ubusd / netifd
+	 * here too, or they leak as orphans of procd. teardown is the
+	 * netns-agnostic variant; the parent never enters the jail netns. */
+	if (!exit_from_child && opts.jail_network_started) {
+		jail_network_teardown();
+		opts.jail_network_started = false;
+	}
 
 	if (!exit_from_child && opts.ocibundle)
 		cgroups_free();
@@ -3479,6 +3489,13 @@ static int parseOCI(const char *jsonfile)
 					LANDLOCK_ACCESS_FS_REMOVE_DIR);
 				if (res)
 					goto errout;
+			} else if (!strcmp(name, "org.openwrt.procd.ubus")) {
+				opts.private_ubus = !strcmp(val, "true") || !strcmp(val, "1");
+			} else if (!strcmp(name, "org.openwrt.procd.netifd")) {
+				opts.private_netifd = !strcmp(val, "true") || !strcmp(val, "1");
+				/* netifd needs a ubus to register with */
+				if (opts.private_netifd)
+					opts.private_ubus = true;
 			}
 
 			if ((opts.mdwe_flags & PR_MDWE_NO_INHERIT) &&
@@ -4861,8 +4878,7 @@ static void post_main(struct uloop_timeout *t)
 			if (opts.setns.ns == -1) {
 				if (!(opts.namespace & CLONE_NEWNET)) {
 					add_mount_bind("/etc/resolv.conf", 1, 0);
-				} else {
-					/* new mount namespace to provide /dev/resolv.conf.d */
+				} else if (opts.private_netifd) {
 					char hostdir[PATH_MAX];
 
 					snprintf(hostdir, PATH_MAX, "/tmp/resolv.conf-%s.d", opts.name);
@@ -5036,8 +5052,15 @@ static void post_main(struct uloop_timeout *t)
 			}
 		}
 
-		if (opts.namespace & CLONE_NEWNET)
-			jail_network_start(parent_ctx, opts.name, jail_process.pid);
+		/* Container-private ubusd / netifd are opt-in via OCI annotations.
+		 * Default off so OCI orchestrators (podman, docker) that manage
+		 * networking via netavark/CNI/CDI on the host side aren't fought
+		 * by a parallel netifd inside the jail. */
+		if ((opts.namespace & CLONE_NEWNET) && opts.private_ubus) {
+			if (!jail_network_start(parent_ctx, opts.name, jail_process.pid,
+						opts.private_netifd))
+				opts.jail_network_started = true;
+		}
 
 		if (opts.netdevices &&
 		    ((opts.namespace & CLONE_NEWNET) || opts.setns.net != -1) &&
@@ -5152,10 +5175,11 @@ static void post_poststart(void)
 
 static void post_poststop(void);
 static void poststop(void) {
-	if (opts.namespace & CLONE_NEWNET) {
+	if (opts.jail_network_started) {
 		setns(netns_fd, CLONE_NEWNET);
 		jail_network_stop();
 		close(netns_fd);
+		opts.jail_network_started = false;
 	}
 	run_hooks(opts.hooks.poststop, post_poststop);
 }
