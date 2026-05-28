@@ -4647,6 +4647,21 @@ int main(int argc, char **argv)
 		}
 	}
 
+	/* conmon's listener closes before the uxc->procd->ujail chain reaches
+	 * create_dev_console; connect now and hand the fd to the child. */
+	if (opts.console_socket && parse_inherited_console_fd(opts.console_socket) < 0) {
+		static char fdspec[16];
+		bool owned;
+		int csfd;
+
+		csfd = open_console_sock(opts.console_socket, &owned, false);
+		if (csfd >= 0) {
+			fcntl(csfd, F_SETFD, 0);
+			snprintf(fdspec, sizeof(fdspec), "%d", csfd);
+			opts.console_socket = fdspec;
+		}
+	}
+
 	if (opts.namespace && !opts.ocibundle)
 		opts.namespace |= CLONE_NEWIPC | CLONE_NEWPID;
 
