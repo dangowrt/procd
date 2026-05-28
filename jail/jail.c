@@ -228,6 +228,8 @@ static int jail_process_pidfd = -1;
 static struct ubus_context *parent_ctx;
 
 int console_fd;
+static int console_slave_fd = -1;
+static char console_slave_name[64];
 
 
 static inline bool has_namespaces(void)
@@ -544,73 +546,34 @@ static int send_console_fd(const char *spec, int console_fd, const char *slave_n
 
 static int create_dev_console(const char *jail_root)
 {
-	char *console_fname;
 	char dev_console_path[PATH_MAX];
-	int slave_console_fd, dev_console_dummy;
+	char fdpath[64];
+	int dev_console_dummy;
 
-	/* Open UNIX/98 virtual console */
-	console_fd = posix_openpt(O_RDWR | O_NOCTTY);
-	if (console_fd < 0)
-		return -1;
+	if (console_slave_fd < 0)
+		return 1;
 
-	console_fname = ptsname(console_fd);
-	DEBUG("got console fd %d and PTS client name %s\n", console_fd, console_fname);
-	if (!console_fname)
-		goto no_console;
-
-	grantpt(console_fd);
-	unlockpt(console_fd);
-
-	if (opts.console_height && opts.console_width) {
-		struct winsize ws = {
-			.ws_row = opts.console_height,
-			.ws_col = opts.console_width,
-		};
-		if (ioctl(console_fd, TIOCSWINSZ, &ws))
-			WARNING("ioctl(TIOCSWINSZ) failed: %m\n");
-	}
-
-	if (opts.console_socket) {
-		if (send_console_fd(opts.console_socket, console_fd, console_fname))
-			goto no_console;
-		close(console_fd);
-	} else {
-		/* pass PTY master to procd */
-		pass_console(console_fd);
-	}
-
-	/* mount-bind PTY slave to /dev/console in jail */
 	snprintf(dev_console_path, sizeof(dev_console_path), "%s/dev/console", jail_root);
 	dev_console_dummy = creat(dev_console_path, 0620);
 	if (dev_console_dummy < 0)
-		goto no_console;
-
+		return 1;
 	close(dev_console_dummy);
 
-	if (mount(console_fname, dev_console_path, "bind", MS_BIND, NULL))
-		goto no_console;
-
-	slave_console_fd = open(console_fname, O_RDWR);
-	if (slave_console_fd < 0)
-		goto no_console;
+	snprintf(fdpath, sizeof(fdpath), "/proc/self/fd/%d", console_slave_fd);
+	if (mount(fdpath, dev_console_path, "bind", MS_BIND, NULL))
+		return 1;
 
 	setsid();
-	if (ioctl(slave_console_fd, TIOCSCTTY, 0) < 0)
+	if (ioctl(console_slave_fd, TIOCSCTTY, 0) < 0)
 		WARNING("TIOCSCTTY on guest console failed: %m\n");
 
-	dup2(slave_console_fd, 0);
-	dup2(slave_console_fd, 1);
-	dup2(slave_console_fd, 2);
-	if (slave_console_fd > 2)
-		close(slave_console_fd);
-
-	DEBUG("using guest console %s\n", console_fname);
+	dup2(console_slave_fd, 0);
+	dup2(console_slave_fd, 1);
+	dup2(console_slave_fd, 2);
+	if (console_slave_fd > 2)
+		close(console_slave_fd);
 
 	return 0;
-
-no_console:
-	close(console_fd);
-	return 1;
 }
 
 static int hook_running = 0;
@@ -884,6 +847,14 @@ static int build_jail_fs(void)
 
 	old_umask = umask(0);
 
+	/* open the slave from the inherited (host) mount NS, before mount_all
+	 * mounts a newinstance devpts that would hide the path. */
+	if (opts.console && console_slave_name[0]) {
+		console_slave_fd = open(console_slave_name, O_RDWR);
+		if (console_slave_fd < 0)
+			WARNING("open guest console slave %s: %m\n", console_slave_name);
+	}
+
 	if (mkdtemp(jail_root) == NULL) {
 		ERROR("mkdtemp(%s) failed: %m\n", jail_root);
 		return -1;
@@ -975,12 +946,41 @@ static int build_jail_fs(void)
 
 static bool exit_from_child;
 static void emit_instance_event(const char *event);
+static void poke_conmon(void)
+{
+	char path[PATH_MAX], *slash;
+	FILE *f;
+	long pid;
+
+	if (!opts.pidfile)
+		return;
+	if (snprintf(path, sizeof(path), "%s", opts.pidfile) >= (int)sizeof(path))
+		return;
+	slash = strrchr(path, '/');
+	if (!slash)
+		return;
+	if (slash - path + sizeof("/conmon.pid") >= sizeof(path))
+		return;
+	strcpy(slash, "/conmon.pid");
+	f = fopen(path, "r");
+	if (!f)
+		return;
+	if (fscanf(f, "%ld", &pid) == 1 && pid > 0)
+		kill((pid_t)pid, SIGCHLD);
+	fclose(f);
+}
 static void free_and_exit(int ret)
 {
 	/* exit_from_child: cloned init unwinding its own setup error. ubus and
 	 * cgroups belong to the parent; only the parent emits and frees them. */
 	if (!exit_from_child && opts.ocibundle && parent_ctx && opts.name)
 		emit_instance_event("instance.stopped");
+
+	/* conmon isn't in our process tree (procd spawned us, not conmon), so
+	 * it never gets SIGCHLD for the container init. Wake it now so its
+	 * kill(container_pid, 0) probe fires and it can write the exit file. */
+	if (!exit_from_child)
+		poke_conmon();
 
 	/* error paths bypass poststop() so reap the per-jail ubusd / netifd
 	 * here too, or they leak as orphans of procd. teardown is the
@@ -4968,6 +4968,49 @@ static void post_main(struct uloop_timeout *t)
 			if (seteuid(opts.root_map_uid)) {
 				ERROR("seteuid(%d) failed: %m\n", opts.root_map_uid);
 				free_and_exit(EXIT_FAILURE);
+			}
+		}
+
+		/* Allocate the PTY in the parent (host mount NS) so the slave
+		 * name we send to conmon resolves in conmon's NS, then keep the
+		 * slave open as console_slave_fd so the child can use it as
+		 * /dev/console without re-opening by name from inside the new
+		 * mount NS (which has a newinstance devpts where the host slave
+		 * path doesn't exist). */
+		if (opts.console) {
+			char *slave_name;
+			int parent_master;
+
+			parent_master = posix_openpt(O_RDWR | O_NOCTTY);
+			if (parent_master < 0) {
+				ERROR("posix_openpt: %m\n");
+				free_and_exit(-1);
+			}
+			if (grantpt(parent_master) || unlockpt(parent_master) ||
+			    !(slave_name = ptsname(parent_master))) {
+				ERROR("grantpt/unlockpt/ptsname failed\n");
+				close(parent_master);
+				free_and_exit(-1);
+			}
+			if (opts.console_height && opts.console_width) {
+				struct winsize ws = {
+					.ws_row = opts.console_height,
+					.ws_col = opts.console_width,
+				};
+				ioctl(parent_master, TIOCSWINSZ, &ws);
+			}
+			strncpy(console_slave_name, slave_name, sizeof(console_slave_name) - 1);
+			console_slave_name[sizeof(console_slave_name) - 1] = '\0';
+			if (opts.console_socket) {
+				if (send_console_fd(opts.console_socket, parent_master, slave_name)) {
+					ERROR("send_console_fd failed\n");
+					close(parent_master);
+					free_and_exit(-1);
+				}
+				close(parent_master);
+			} else {
+				console_fd = parent_master;
+				pass_console(console_fd);
 			}
 		}
 
