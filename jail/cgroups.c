@@ -90,14 +90,17 @@ void cgroups_free(void)
 {
 	struct cgval *valp, *tmp;
 
-	if (initialized) {
-		avl_remove_all_elements(&cgvals, valp, avl, tmp) {
-			free((void *)(valp->avl.key));
-			free(valp->val);
-			free(valp);
-		}
-		free(cgroup_path);
+	if (!initialized)
+		return;
+
+	avl_remove_all_elements(&cgvals, valp, avl, tmp) {
+		free((void *)(valp->avl.key));
+		free(valp->val);
+		free(valp);
 	}
+	free(cgroup_path);
+	cgroup_path = NULL;
+	initialized = false;
 }
 
 static int cgroups_write_attr(const char *attr, const char *val, size_t vlen)
