@@ -590,17 +590,21 @@ static int create_dev_console(const char *jail_root)
 	if (mount(console_fname, dev_console_path, "bind", MS_BIND, NULL))
 		goto no_console;
 
-	/* use PTY slave for stdio */
-	slave_console_fd = open(console_fname, O_RDWR); /* | O_NOCTTY */
+	slave_console_fd = open(console_fname, O_RDWR);
 	if (slave_console_fd < 0)
 		goto no_console;
+
+	setsid();
+	if (ioctl(slave_console_fd, TIOCSCTTY, 0) < 0)
+		WARNING("TIOCSCTTY on guest console failed: %m\n");
 
 	dup2(slave_console_fd, 0);
 	dup2(slave_console_fd, 1);
 	dup2(slave_console_fd, 2);
-	close(slave_console_fd);
+	if (slave_console_fd > 2)
+		close(slave_console_fd);
 
-	INFO("using guest console %s\n", console_fname);
+	DEBUG("using guest console %s\n", console_fname);
 
 	return 0;
 
@@ -2170,7 +2174,7 @@ static void post_start_hook(void)
 		fcntl(preload_memfd_fd, F_SETFD, 0);
 	if (seccomp_bpf_memfd_fd >= 0)
 		fcntl(seccomp_bpf_memfd_fd, F_SETFD, 0);
-	INFO("exec-ing %s\n", *opts.jail_argv);
+	DEBUG("exec-ing %s\n", *opts.jail_argv);
 	if (opts.envp) /* respect PATH if potentially set in ENV */
 		execvpe(*opts.jail_argv, opts.jail_argv, envp);
 	else
