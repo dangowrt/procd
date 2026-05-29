@@ -798,8 +798,10 @@ static int uxc_attach(const char *container_name)
 	struct ubus_context *ctx;
 	uint32_t id;
 	static struct blob_buf req;
-	int client_fd, server_fd, tty_fd;
+	int client_fd = -1, server_fd = -1, tty_fd = -1;
 	struct termios oldtermios;
+	bool tty_raw = false;
+	int rc;
 
 	ctx = ubus_connect(NULL);
 	if (!ctx) {
@@ -807,64 +809,64 @@ static int uxc_attach(const char *container_name)
 		return -ECONNREFUSED;
 	}
 
-	/* open pseudo-terminal pair */
 	client_fd = posix_openpt(O_RDWR | O_NOCTTY);
 	if (client_fd < 0) {
 		fprintf(stderr, "can't create virtual console!\n");
-		ubus_free(ctx);
-		return -EIO;
+		rc = -EIO;
+		goto out;
 	}
-	setup_tios(client_fd, &oldtermios);
 	grantpt(client_fd);
 	unlockpt(client_fd);
 	server_fd = open(ptsname(client_fd), O_RDWR | O_NOCTTY);
 	if (server_fd < 0) {
 		fprintf(stderr, "can't open virtual console!\n");
-		close(client_fd);
-		ubus_free(ctx);
-		return -EIO;
+		rc = -EIO;
+		goto out;
 	}
-	setup_tios(server_fd, &oldtermios);
 
 	tty_fd = open("/dev/tty", O_RDWR);
 	if (tty_fd < 0) {
 		fprintf(stderr, "can't open local console!\n");
-		close(server_fd);
-		close(client_fd);
-		ubus_free(ctx);
-		return -EIO;
+		rc = -EIO;
+		goto out;
 	}
-	setup_tios(tty_fd, &oldtermios);
+	if (!setup_tios(tty_fd, &oldtermios))
+		tty_raw = true;
 
-	/* register server-side with procd */
 	blob_buf_init(&req, 0);
 	blobmsg_add_string(&req, "name", container_name);
 	blobmsg_add_string(&req, "instance", container_name);
 
-	if (ubus_lookup_id(ctx, "container", &id) ||
-	    ubus_invoke_fd(ctx, id, "console_attach", req.head, NULL, NULL, 3000, server_fd)) {
-		fprintf(stderr, "ubus request failed\n");
-		close(tty_fd);
-		close(server_fd);
-		close(client_fd);
+	if (ubus_lookup_id(ctx, "container", &id)) {
+		fprintf(stderr, "uxc: 'container' ubus object not found\n");
 		blob_buf_free(&req);
-		ubus_free(ctx);
-		return -ENXIO;
+		rc = -ENXIO;
+		goto out;
+	}
+	rc = ubus_invoke_fd(ctx, id, "console_attach", req.head, NULL, NULL, 3000, server_fd);
+	blob_buf_free(&req);
+	if (rc) {
+		if (rc == UBUS_STATUS_NOT_SUPPORTED)
+			fprintf(stderr, "uxc: container '%s' has no console; "
+				"re-create it with console=true (OCI process.terminal=true)\n",
+				container_name);
+		else
+			fprintf(stderr, "uxc: console_attach failed: %s\n", ubus_strerror(rc));
+		rc = -ENXIO;
+		goto out;
 	}
 
 	close(server_fd);
-	blob_buf_free(&req);
+	server_fd = -1;
 	ubus_free(ctx);
+	ctx = NULL;
 
 	uloop_init();
 
-	/* forward between stdio and client_fd until detach is requested */
 	lufd.stream.notify_read = local_cb;
 	ustream_fd_init(&lufd, tty_fd);
 
 	cufd.stream.notify_read = client_cb;
-/* ToDo: handle remote close and other events */
-//	cufd.stream.notify_state = client_state_cb;
 	ustream_fd_init(&cufd, client_fd);
 
 	fprintf(stderr, "attaching to jail console. press [CTRL]+[B] to exit.\n");
@@ -873,12 +875,22 @@ static int uxc_attach(const char *container_name)
 	close(2);
 	uloop_run();
 
-	tcsetattr(tty_fd, TCSAFLUSH, &oldtermios);
 	ustream_free(&lufd.stream);
 	ustream_free(&cufd.stream);
-	close(client_fd);
+	rc = 0;
 
-	return 0;
+out:
+	if (tty_raw && tty_fd >= 0)
+		tcsetattr(tty_fd, TCSAFLUSH, &oldtermios);
+	if (tty_fd >= 0)
+		close(tty_fd);
+	if (server_fd >= 0)
+		close(server_fd);
+	if (client_fd >= 0)
+		close(client_fd);
+	if (ctx)
+		ubus_free(ctx);
+	return rc;
 }
 
 static int uxc_state(char *name)
