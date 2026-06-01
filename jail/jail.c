@@ -2183,10 +2183,14 @@ static void post_start_hook(void)
 	if (seccomp_bpf_memfd_fd >= 0)
 		fcntl(seccomp_bpf_memfd_fd, F_SETFD, 0);
 	DEBUG("exec-ing %s\n", *opts.jail_argv);
-	if (opts.envp) /* respect PATH if potentially set in ENV */
+	if (opts.envp) { /* respect PATH if potentially set in ENV */
+		/* musl execvpe() resolves PATH via getenv() against our own
+		 * environ, not envp, so point environ at the container env. */
+		environ = envp;
 		execvpe(*opts.jail_argv, opts.jail_argv, envp);
-	else
+	} else {
 		execve(*opts.jail_argv, opts.jail_argv, envp);
+	}
 
 	/* we get there only if execve fails */
 	ERROR("failed to execve %s: %m\n", *opts.jail_argv);
